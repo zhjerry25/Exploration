@@ -1,6 +1,6 @@
 # Stack model (attention push/pop)
 
-`mga.stack_model.StackModel`: `forward([B,N], sup=None) -> [B,N,vocab]`.
+`st.stack_model.StackModel`: `forward([B,N], sup=None) -> [B,N,vocab]`.
 Replaces the index model's machinery with a single exact mechanism.
 
 ## Doctrine
@@ -47,4 +47,4 @@ perturbation and prefix truncation leave earlier logits bit-identical
 
 `sup` restricts push/pop to supervised positions (retrieval tasks: a handful
 per sequence, so training cost is ~linear; sup=None for leak tests/LM).
-CLI: `--model stack`, `--read_m` = topk blocks per head, `--local_layers`.
+CLI: `python -m st.train`, `--read_m` = topk blocks per head, `--local_layers`.
