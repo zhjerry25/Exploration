@@ -16,6 +16,11 @@ Usage:
   # enwik8 LM (data/enwik8 bundled)
   python -m st.train --task lm --n 4096 --steps 15000 --bs 16 --lr 5e-4 \
       --save runs/lm.pt
+  # pair-state readout (--arch psr): baseline is the degenerate point
+  python -m st.train --arch psr --task lm --n 4096 --steps 15000 --bs 16 \
+      --lr 5e-4 --bf16 --p_mode ones --no_write_gelu --rc 64   # baseline
+  python -m st.train --arch psr --task lm --n 4096 --steps 15000 --bs 16 \
+      --lr 5e-4 --bf16 --rc 128                                 # PSR default
 """
 import argparse
 import contextlib
@@ -30,6 +35,7 @@ import torch.nn.functional as F
 from . import data
 from . import lmdata
 from .stack_model import StackModel
+from .psr_model import PSRModel
 
 VOCABS = {"passkey": data.VOCAB, "copying": data.VOCAB, "mqar": data.VOCAB,
           "lm": 256}
@@ -51,10 +57,34 @@ def amp_ctx(args, device):
 
 def build(args, device="cpu"):
     vocab = VOCABS.get(getattr(args, "task", "passkey"), data.VOCAB)
-    m = StackModel(vocab, dim=args.d, heads=args.heads, block_size=args.b,
-                   topk=getattr(args, "read_m", 64),
-                   local_layers=getattr(args, "local_layers", 2))
+    if getattr(args, "arch", "stack") == "psr":
+        m = PSRModel(vocab, dim=args.d, heads=args.heads,
+                     layers=getattr(args, "layers", 6),
+                     d_a=getattr(args, "da", None), r_c=getattr(args, "rc", None),
+                     write_gelu=not getattr(args, "no_write_gelu", False),
+                     p_mode=getattr(args, "p_mode", "learned"),
+                     ffn_ratio=getattr(args, "ffn_ratio", 4.0))
+        if device.type == "cuda":
+            probe_psr_sdpa(m, device)
+    else:
+        m = StackModel(vocab, dim=args.d, heads=args.heads, block_size=args.b,
+                       topk=getattr(args, "read_m", 64),
+                       local_layers=getattr(args, "local_layers", 2),
+                       ffn_ratio=getattr(args, "ffn_ratio", 4.0))
     return m.to(device)
+
+
+def probe_psr_sdpa(model, device):
+    """One warmup block-shape SDPA with value dim != qk dim; reports which
+    fused backends are available (flash may decline Ev != E, in which case
+    SDPA silently falls back to the still-fused mem-efficient path)."""
+    b0 = model.blocks[0]
+    q = torch.zeros(1, b0.heads, 8, b0.d_a, device=device)
+    c = torch.zeros(1, b0.heads, 8, b0.r_c, device=device)
+    F.scaled_dot_product_attention(q, q, c, is_causal=True)
+    avail = dict(flash=torch.backends.cuda.flash_sdp_enabled(),
+                 mem_efficient=torch.backends.cuda.mem_efficient_sdp_enabled())
+    print(f"[psr] SDPA probe ok; backends: {avail}", flush=True)
 
 
 def _emb_norm(model):
@@ -98,6 +128,22 @@ def posloss_mod_b(model, args, g_eval, device, bb):
                              tgt.reshape(-1), reduction="none")
         ce = ce.view(tgt.shape[0], tgt.shape[1]).mean(0)
         return [round(x, 3) for x in ce.view(-1, bb).mean(0).div(0.6931).tolist()]
+
+
+def posloss_quartiles(model, args, g_eval, device):
+    """Mean bpc over contiguous position quartiles (one fresh val batch).
+
+    Signature diagnostic: if the content-channel-rank hypothesis holds, the
+    PSR gain over baseline should grow with position depth (more context =
+    more high-order interactions in play)."""
+    with torch.no_grad(), amp_ctx(args, device):
+        idx, tgt, mask, _ = make_batch(args, g_eval, device, split="val")
+        lgs = model(idx)
+        ce = F.cross_entropy(lgs.reshape(-1, lgs.shape[-1]).float(),
+                             tgt.reshape(-1), reduction="none")
+        ce = ce.view(tgt.shape[0], tgt.shape[1]).mean(0)
+        return [round(x.mean().div(0.6931).item(), 4)
+                for x in ce.tensor_split(4)]
 
 
 def save_ckpt(path, model, opt, ema, args, step):
@@ -180,6 +226,8 @@ def evaluate(model, args, g_eval, device, batches):
         # (starved for cross-block info) or uniform (capacity-bound)?
         rec["posloss_mod_b"] = posloss_mod_b(model, args, g_eval, device,
                                              args.b)
+        rec["posloss_quartiles"] = posloss_quartiles(model, args, g_eval,
+                                                     device)
     if poss:
         h, p = torch.cat(hits).float(), torch.cat(poss)
         rec["depth_exact"] = [
@@ -195,9 +243,14 @@ def evaluate(model, args, g_eval, device, batches):
 def train(args, device):
     torch.manual_seed(args.seed)
     model = build(args, device=device)
+    if getattr(args, "compile", False):
+        try:
+            model = torch.compile(model)
+        except Exception as e:
+            print(f"[compile] torch.compile unavailable: {e}", flush=True)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"model=stack n={args.n} params={n_params/1e6:.2f}M "
-          f"device={device}", flush=True)
+    print(f"model={getattr(args, 'arch', 'stack')} n={args.n} "
+          f"params={n_params/1e6:.2f}M device={device}", flush=True)
     ema = None
     if args.ema > 0:
         ema = {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -320,9 +373,22 @@ def main():
     ap.add_argument("--eval_only", action="store_true",
                     help="load --resume checkpoint, eval once at args.n, exit")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--arch", default="stack", choices=["stack", "psr"])
+    ap.add_argument("--layers", type=int, default=6, help="psr block count")
+    ap.add_argument("--rc", type=int, default=None,
+                    help="psr content width per head (default: dim//heads)")
+    ap.add_argument("--da", type=int, default=None,
+                    help="psr addressing width per head (default: dim//heads)")
+    ap.add_argument("--no_write_gelu", action="store_true",
+                    help="psr: linear content projection (ablation)")
+    ap.add_argument("--p_mode", default="learned", choices=["learned", "ones"],
+                    help="psr: reader-side modulation (ones = degenerate)")
+    ap.add_argument("--ffn_ratio", type=float, default=4.0)
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile the model (best effort)")
     args = ap.parse_args()
     if args.tag is None:
-        args.tag = f"stack_{args.task}_n{args.n}_s{args.seed}"
+        args.tag = f"{args.arch}_{args.task}_n{args.n}_s{args.seed}"
     device = get_device()
     if args.selftest:
         leak_test()
