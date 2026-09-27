@@ -2,7 +2,7 @@
 
 The end-to-end oracle reimplements the plumbing (block scoring, visibility,
 topk, gate, candidate gathering) with Python loops while calling the trusted
-modules from st.blocks.
+modules from st.blocks, and supports any arch spec (multiple/cycled G rounds).
 """
 import math
 import unittest
@@ -34,43 +34,45 @@ def oracle_logits(m, ids, positions):
     for t in positions:
         k = t // b
         lo = max((k - 1) * b, 0)
-        q = m.wq(m.q_norm(x[:, t])).reshape(batch, m.heads, m.hd)  # [B,H,hd]
-        # push: exact block partition function
-        ts = torch.einsum('bhd,bgwhd->bhgw', q, kb) / math.sqrt(m.hd)
-        s = ts.logsumexp(-1)                         # [B,H,G]
         cover_end = (torch.arange(groups) + 1) * b
         vis = cover_end <= (k - 1) * b             # [G]
-        sm = s.masked_fill(~vis[None, None, :], float('-inf'))
-        with torch.no_grad():
-            keep = min(m.topk, groups)
-            top, sel = sm.topk(keep, dim=-1)
-            sel_ok = torch.isfinite(top)
-        gate = torch.nan_to_num(sm - sm.logsumexp(-1, keepdim=True),
-                                nan=0.0, neginf=0.0)
-        gate_sel = torch.where(sel_ok, torch.gather(gate, 2, sel),
-                               torch.zeros((), dtype=gate.dtype))
-        tok = sel[..., None] * b + torch.arange(b)
-        tok = tok.reshape(batch, m.heads, -1)
-        tok_ok = (sel_ok[..., None].expand(-1, -1, -1, b)
-                  .reshape(batch, m.heads, -1)
-                  & (tok < n) & (tok <= t))
-        kr = _gather_heads(raw_k.transpose(1, 2),
-                           tok.clamp(0, n - 1)[:, :, None, :])[:, :, 0]
-        vr = _gather_heads(raw_v.transpose(1, 2),
-                           tok.clamp(0, n - 1)[:, :, None, :])[:, :, 0]
-        bias = gate_sel[..., None].expand(-1, -1, -1, b)
-        bias = bias.reshape(batch, m.heads, -1)
-        kl, vl = raw_k[:, lo:t + 1], raw_v[:, lo:t + 1]
-        s_loc = torch.einsum('bhd,bwhd->bhw', q, kl) / math.sqrt(m.hd)
-        s_rem = torch.einsum('bhd,bhkd->bhk', q, kr) / math.sqrt(m.hd) + bias
-        alls = torch.cat([s_loc, s_rem], -1)
-        mask = torch.cat([torch.ones_like(s_loc, dtype=torch.bool), tok_ok], -1)
-        p = alls.masked_fill(~mask, float('-inf')).softmax(-1)
-        w = s_loc.shape[-1]
-        ctx = torch.einsum('bhw,bwhd->bhd', p[..., :w], vl) \
-            + torch.einsum('bhk,bhkd->bhd', p[..., w:], vr)
-        z = x[:, t] + m.read_out(ctx.reshape(batch, m.dim))
-        z = z + m.ffn(m.ffn_norm(z))
+        z = x[:, t]                                 # [B,dim]
+        for rd in m.reads:
+            q = rd.wq(rd.q_norm(z)).reshape(batch, m.heads, m.hd)  # [B,H,hd]
+            # push: exact block partition function
+            ts = torch.einsum('bhd,bgwhd->bhgw', q, kb) / math.sqrt(m.hd)
+            s = ts.logsumexp(-1)                         # [B,H,G]
+            sm = s.masked_fill(~vis[None, None, :], float('-inf'))
+            with torch.no_grad():
+                keep = min(m.topk, groups)
+                top, sel = sm.topk(keep, dim=-1)
+                sel_ok = torch.isfinite(top)
+            gate = torch.nan_to_num(sm - sm.logsumexp(-1, keepdim=True),
+                                    nan=0.0, neginf=0.0)
+            gate_sel = torch.where(sel_ok, torch.gather(gate, 2, sel),
+                                   torch.zeros((), dtype=gate.dtype))
+            tok = sel[..., None] * b + torch.arange(b)
+            tok = tok.reshape(batch, m.heads, -1)
+            tok_ok = (sel_ok[..., None].expand(-1, -1, -1, b)
+                      .reshape(batch, m.heads, -1)
+                      & (tok < n) & (tok <= t))
+            kr = _gather_heads(raw_k.transpose(1, 2),
+                               tok.clamp(0, n - 1)[:, :, None, :])[:, :, 0]
+            vr = _gather_heads(raw_v.transpose(1, 2),
+                               tok.clamp(0, n - 1)[:, :, None, :])[:, :, 0]
+            bias = gate_sel[..., None].expand(-1, -1, -1, b)
+            bias = bias.reshape(batch, m.heads, -1)
+            kl, vl = raw_k[:, lo:t + 1], raw_v[:, lo:t + 1]
+            s_loc = torch.einsum('bhd,bwhd->bhw', q, kl) / math.sqrt(m.hd)
+            s_rem = torch.einsum('bhd,bhkd->bhk', q, kr) / math.sqrt(m.hd) + bias
+            alls = torch.cat([s_loc, s_rem], -1)
+            mask = torch.cat([torch.ones_like(s_loc, dtype=torch.bool), tok_ok], -1)
+            p = alls.masked_fill(~mask, float('-inf')).softmax(-1)
+            w = s_loc.shape[-1]
+            ctx = torch.einsum('bhw,bwhd->bhd', p[..., :w], vl) \
+                + torch.einsum('bhk,bhkd->bhd', p[..., w:], vr)
+            z = z + rd.read_out(ctx.reshape(batch, m.dim))
+            z = z + rd.ffn(rd.ffn_norm(z))
         outs.append(m.lm_head(m.final_norm(z)))
     return torch.stack(outs, 1)
 
@@ -134,8 +136,9 @@ class StackModelTests(unittest.TestCase):
                                        rtol=1e-9, atol=1e-10)
         m.train()
         probe = torch.randn(2, 4, 31, dtype=torch.double)
-        params = [m.wq.weight, m.read_out.weight, m.raw_kv.proj.weight,
-                  m.local[0].qkv.weight, m.ffn[0].weight, m.embedding.weight]
+        params = [m.reads[0].wq.weight, m.reads[0].read_out.weight,
+                  m.raw_kv.proj.weight, m.local[0].qkv.weight,
+                  m.reads[0].ffn[0].weight, m.embedding.weight]
         out = m(ids, sup=sup)
         grad_a = torch.autograd.grad((out[:, -4:] * probe).sum(), params,
                                      retain_graph=True)
@@ -144,19 +147,77 @@ class StackModelTests(unittest.TestCase):
         for a, e in zip(grad_a, grad_e):
             torch.testing.assert_close(a, e, rtol=1e-8, atol=1e-9)
 
-    def test_future_perturbation_and_prefix_invariance(self):
-        m = model().double().eval()
-        ids = torch.randint(31, (2, 33))
+    def test_dense_fast_path_matches_sparse_oracle(self):
+        """topk >= total blocks triggers the dense fast path; it must agree
+        with the sparse reference plumbing (oracle) value-wise, with and
+        without sup."""
+        m = model(topk=64).double().eval()  # 64 >= 11 blocks -> dense
+        ids = torch.randint(31, (2, 21))
+        sup = torch.zeros(2, 21, dtype=torch.bool)
+        sup[:, -4:] = True
         with torch.no_grad():
+            actual = m(ids, sup=sup)
+            expected = oracle_logits(m, ids, [17, 18, 19, 20])
+            torch.testing.assert_close(actual[:, -4:], expected,
+                                       rtol=1e-9, atol=1e-10)
             full = m(ids)
-            for cut in [1, 3, 4, 5, 8, 15, 16, 17, 31, 32]:
-                with self.subTest(cut=cut):
-                    changed = ids.clone()
-                    changed[:, cut:] = (changed[:, cut:] + 7) % 31
-                    torch.testing.assert_close(m(changed)[:, :cut], full[:, :cut],
-                                               rtol=1e-9, atol=1e-10)
-                    torch.testing.assert_close(m(ids[:, :cut]), full[:, :cut],
-                                               rtol=1e-9, atol=1e-10)
+            expected_full = oracle_logits(m, ids, list(range(21)))
+            torch.testing.assert_close(full, expected_full, rtol=1e-9, atol=1e-10)
+        loss = m(ids, sup=sup).square().mean()
+        loss.backward()
+        for p in m.parameters():
+            if p.grad is not None:
+                self.assertTrue(torch.isfinite(p.grad).all())
+
+    def test_shared_weight_cycling(self):
+        shared = model(arch="L,(G)x2")
+        self.assertIs(shared.reads[0], shared.reads[1])
+        indep = model(arch="L,Gx2")
+        self.assertIsNot(indep.reads[0], indep.reads[1])
+        p_shared = sum(p.numel() for p in shared.parameters())
+        p_indep = sum(p.numel() for p in indep.parameters())
+        self.assertLess(p_shared, p_indep)
+        # cycled model must match the multi-round oracle
+        m = model(arch="L,(G)x2", topk=3).double().eval()
+        ids = torch.randint(31, (2, 21))
+        sup = torch.zeros(2, 21, dtype=torch.bool)
+        sup[:, -4:] = True
+        with torch.no_grad():
+            actual = m(ids, sup=sup)
+            expected = oracle_logits(m, ids, [17, 18, 19, 20])
+            torch.testing.assert_close(actual[:, -4:], expected,
+                                       rtol=1e-9, atol=1e-10)
+
+    def test_arch_parser(self):
+        for bad in ["", "G,L", "Lx0", "X", "(L)x0", "(G)", "L,", "Lx2,(G)x"]:
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                model(arch=bad)
+        for good, passes in [("L", 1), ("Lx2,G", 3), ("(L)x3,(G)x2", 5),
+                             ("Gx2", 2), ("L,Gx2,Lx1", None)]:
+            with self.subTest(good=good):
+                if passes is None:
+                    with self.assertRaises(ValueError):
+                        model(arch=good)
+                else:
+                    m = model(arch=good)
+                    self.assertEqual(len(m.local) + len(m.reads), passes)
+
+    def test_future_perturbation_and_prefix_invariance(self):
+        for arch in ["Lx2,G", "Lx2,(G)x2", "Lx2,Gx2"]:
+            with self.subTest(arch=arch):
+                m = model(arch=arch).double().eval()
+                ids = torch.randint(31, (2, 33))
+                with torch.no_grad():
+                    full = m(ids)
+                    for cut in [1, 3, 4, 5, 8, 15, 16, 17, 31, 32]:
+                        changed = ids.clone()
+                        changed[:, cut:] = (changed[:, cut:] + 7) % 31
+                        torch.testing.assert_close(m(changed)[:, :cut],
+                                                   full[:, :cut],
+                                                   rtol=1e-9, atol=1e-10)
+                        torch.testing.assert_close(m(ids[:, :cut])[:, :cut],
+                                                   full[:, :cut],
+                                                   rtol=1e-9, atol=1e-10)
 
     def test_no_gradient_to_future_inputs(self):
         m = model().double()
@@ -195,7 +256,8 @@ class StackModelTests(unittest.TestCase):
         kb = F.pad(raw_k, (0, 0, 0, 0, 0, groups * b - n)).reshape(
             2, groups, b, m.heads, m.hd)
         rows = torch.arange(2)[:, None]
-        q = m.wq(m.q_norm(x[rows, pos])).reshape(2, 5, m.heads, m.hd)
+        q = m.reads[0].wq(m.reads[0].q_norm(x[rows, pos])).reshape(
+            2, 5, m.heads, m.hd)
         s = m.push_scores(q, kb, visible)
         s.retain_grad()
         loss = s.logsumexp(-1).square().mean()  # stand-in touching the gate
@@ -214,7 +276,7 @@ class StackModelTests(unittest.TestCase):
         self.assertTrue(len(unselected) > 0)
         self.assertGreater(sg[:, unselected].abs().sum().item(), 0)
         self.assertEqual(sg[:, 15:].abs().sum().item(), 0.0)
-        for name in ["wq.weight", "raw_kv.proj.weight"]:
+        for name in ["reads.0.wq.weight", "raw_kv.proj.weight"]:
             p = dict(m.named_parameters())[name]
             self.assertIsNotNone(p.grad, name)
             self.assertGreater(p.grad.norm().item(), 0, name)
@@ -232,8 +294,9 @@ class StackModelTests(unittest.TestCase):
         block_of = pos // b
         cover_end = (torch.arange(groups) + 1) * b
         visible = cover_end[None, None, :] <= ((block_of - 1) * b)[:, :, None]
-        q = m.wq(m.q_norm(x[torch.arange(2)[:, None], pos])).reshape(
-            2, 3, m.heads, m.hd)
+        q = m.reads[0].wq(m.reads[0].q_norm(x[torch.arange(2)[:, None],
+                                              pos])).reshape(2, 3, m.heads,
+                                                             m.hd)
         s = m.push_scores(q, kb, visible)
         # manual: per (row, pos, head, block)
         for row in range(2):
@@ -269,10 +332,24 @@ class StackModelTests(unittest.TestCase):
             if p.grad is not None:
                 self.assertTrue(torch.isfinite(p.grad).all())
 
+    def test_diagnose_smoke(self):
+        m = model(topk=2).eval()
+        ids = torch.randint(31, (2, 33))
+        with torch.no_grad():
+            rec = m.diagnose(ids)
+        self.assertIn("sel_cov", rec)
+        self.assertGreaterEqual(rec["sel_cov"], 0.0)
+        self.assertLessEqual(rec["sel_cov"], 1.0)
+        m_dense = model(topk=64).eval()  # all blocks selected -> coverage 1
+        with torch.no_grad():
+            rec_dense = m_dense.diagnose(ids)
+        self.assertAlmostEqual(rec_dense["sel_cov"], 1.0, places=3)
+        self.assertNotIn("gate_margin", rec_dense)  # nothing unselected
+
     def test_configuration_and_empty_inputs(self):
         for kwargs in [dict(block_size=1), dict(heads=3), dict(topk=0),
                        dict(local_layers=0), dict(ffn_ratio=0),
-                       dict(pos_chunk=0)]:
+                       dict(pos_chunk=-1)]:
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 model(**kwargs)
         m = model()

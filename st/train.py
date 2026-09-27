@@ -1,4 +1,4 @@
-"""Train/eval driver for the stack model.
+"""Train/eval driver for the stack model and the dense baseline.
 
 Usage:
   python -m st.train --selftest          # leak test (must be 0 diff) + overfit
@@ -16,6 +16,12 @@ Usage:
   # enwik8 LM (data/enwik8 bundled)
   python -m st.train --task lm --n 4096 --steps 15000 --bs 16 --lr 5e-4 \
       --save runs/lm.pt
+  # dual-side scaling (arch spec: LxN independent / (X)xN weight-shared)
+  python -m st.train --task lm --n 4096 --arch "Lx2,(G)x4" --bf16 ...
+  # dense transformer baseline, same params and layer passes as "Lx2,G"
+  python -m st.train --model baseline --layers 3 --task lm --n 4096 ...
+  # density-scaled hard MQAR: pairs grow with n, two-token keys
+  python -m st.train --task mqar --n 512 --npairs_density 0.03125 --nkeytoks 2 ...
 """
 import argparse
 import contextlib
@@ -29,6 +35,7 @@ import torch.nn.functional as F
 
 from . import data
 from . import lmdata
+from .baseline import BaselineModel
 from .stack_model import StackModel
 
 VOCABS = {"passkey": data.VOCAB, "copying": data.VOCAB, "mqar": data.VOCAB,
@@ -51,9 +58,16 @@ def amp_ctx(args, device):
 
 def build(args, device="cpu"):
     vocab = VOCABS.get(getattr(args, "task", "passkey"), data.VOCAB)
-    m = StackModel(vocab, dim=args.d, heads=args.heads, block_size=args.b,
-                   topk=getattr(args, "read_m", 64),
-                   local_layers=getattr(args, "local_layers", 2))
+    if getattr(args, "model", "stack") == "baseline":
+        m = BaselineModel(vocab, dim=args.d, heads=args.heads,
+                          layers=getattr(args, "layers", 3),
+                          ffn_ratio=getattr(args, "ffn_ratio", 4))
+    else:
+        m = StackModel(vocab, dim=args.d, heads=args.heads, block_size=args.b,
+                       topk=getattr(args, "read_m", 64),
+                       arch=getattr(args, "arch", None),
+                       local_layers=getattr(args, "local_layers", None),
+                       ffn_ratio=getattr(args, "ffn_ratio", 4))
     return m.to(device)
 
 
@@ -69,9 +83,12 @@ def make_batch(args, g, device, n=None, split="train"):
     if args.task == "lm":
         return lmdata.lm_batch(args.bs, n or args.n, g, device, split=split)
     if args.task == "mqar":
-        return data.mqar_batch(args.bs, n or args.n, g, device,
-                               n_pairs=getattr(args, "npairs", 16),
-                               n_queries=getattr(args, "nqueries", 4))
+        nn = n or args.n
+        npairs = data.resolve_npairs(nn, getattr(args, "npairs", 16),
+                                     getattr(args, "npairs_density", 0.0))
+        return data.mqar_batch(args.bs, nn, g, device, n_pairs=npairs,
+                               n_queries=getattr(args, "nqueries", 4),
+                               key_tokens=getattr(args, "nkeytoks", 1))
     return BATCHERS[args.task](args.bs, n or args.n, g, device)
 
 
@@ -89,20 +106,54 @@ def loss_and_acc(model, idx, tgt, mask):
             hit_vec, hit.float().mean(0))
 
 
-def posloss_mod_b(model, args, g_eval, device, bb):
-    """Mean bpc by position index mod bb (one fresh val batch)."""
+def posloss_diag(model, args, g_eval, device, bb, bins=16):
+    """Per-position loss diagnostics on one fresh val batch: mean bpc by
+    position index mod bb (block-boundary pattern) plus the log-binned
+    bpc-by-absolute-position curve (the state-dilution probe: a healthy
+    long-context model's loss should FALL with position)."""
     with torch.no_grad(), amp_ctx(args, device):
         idx, tgt, mask, _ = make_batch(args, g_eval, device, split="val")
         lgs = model(idx)
         ce = F.cross_entropy(lgs.reshape(-1, lgs.shape[-1]).float(),
                              tgt.reshape(-1), reduction="none")
-        ce = ce.view(tgt.shape[0], tgt.shape[1]).mean(0)
-        return [round(x, 3) for x in ce.view(-1, bb).mean(0).div(0.6931).tolist()]
+        ce = ce.view(tgt.shape[0], tgt.shape[1]).mean(0).div(0.6931)  # [n] bpc
+        n = ce.shape[0]
+        mod_b = None
+        if n % bb == 0:
+            mod_b = [round(x, 3) for x in ce.view(-1, bb).mean(0).tolist()]
+        edges = torch.logspace(0, math.log10(n), bins + 1).round().long()
+        edges = edges.unique().clamp(min=1).tolist()
+        curve, lo = [], 0
+        for hi in edges:
+            if hi > lo:
+                curve.append(round(ce[lo:hi].mean().item(), 3))
+            lo = hi
+        return mod_b, curve
 
 
 def save_ckpt(path, model, opt, ema, args, step):
     torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
                 "ema": ema, "args": vars(args), "step": step}, path)
+
+
+_OLD_READ_PREFIXES = ("q_norm.", "wq.", "read_out.", "ffn_norm.", "ffn.")
+
+
+def remap_old_read_keys(sd):
+    """Pre-arch checkpoints stored the single read round at top level
+    (wq.*, read_out.*, q_norm.*, ffn_norm.*, ffn.*); they now live under
+    reads.0.*. New checkpoints are unaffected (their keys never start with
+    these prefixes)."""
+    if sd is None:
+        return None
+    out = {}
+    for k, v in sd.items():
+        for pre in _OLD_READ_PREFIXES:
+            if k.startswith(pre):
+                k = "reads.0." + k
+                break
+        out[k] = v
+    return out
 
 
 def leak_test():
@@ -158,9 +209,12 @@ def lr_at(step, total, base):
 def evaluate(model, args, g_eval, device, batches):
     """Shared eval body: loss/exact/depth/bpc over fresh val batches."""
     ems, pds, hits, poss, lss, cas = [], [], [], [], [], []
+    first_batch = None
     with torch.no_grad(), amp_ctx(args, device):
-        for _ in range(batches):
+        for i in range(batches):
             idx, tgt, mask, pos = make_batch(args, g_eval, device, split="val")
+            if i == 0:
+                first_batch = (idx, mask, pos)
             l, pd, em, hv, ca = loss_and_acc(model, idx, tgt, mask)
             lss.append(l.item())
             ems.append(em)
@@ -177,9 +231,15 @@ def evaluate(model, args, g_eval, device, batches):
     if args.task == "lm":
         rec["bpc"] = round(sum(lss) / len(lss) / 0.6931, 4)
         # per-position loss by index mod b: is the gap at block boundaries
-        # (starved for cross-block info) or uniform (capacity-bound)?
-        rec["posloss_mod_b"] = posloss_mod_b(model, args, g_eval, device,
-                                             args.b)
+        # (starved for cross-block info) or uniform (capacity-bound)? plus
+        # the log-binned bpc-by-position curve (state-dilution probe).
+        mod_b, curve = posloss_diag(model, args, g_eval, device, args.b)
+        rec["posloss_mod_b"] = mod_b
+        rec["posloss_bpc_curve"] = curve
+    if isinstance(model, StackModel):
+        idx0, mask0, pos0 = first_batch
+        rec.update(model.diagnose(idx0, mask0,
+                                  pos0 if args.task == "passkey" else None))
     if poss:
         h, p = torch.cat(hits).float(), torch.cat(poss)
         rec["depth_exact"] = [
@@ -196,7 +256,12 @@ def train(args, device):
     torch.manual_seed(args.seed)
     model = build(args, device=device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"model=stack n={args.n} params={n_params/1e6:.2f}M "
+    if isinstance(model, StackModel):
+        passes = len(model.local) + len(model.reads)
+        desc = f"model=stack arch={model.arch} passes={passes}"
+    else:
+        desc = f"model=baseline layers={len(model.blocks)}"
+    print(f"{desc} n={args.n} params={n_params/1e6:.2f}M "
           f"device={device}", flush=True)
     ema = None
     if args.ema > 0:
@@ -208,14 +273,15 @@ def train(args, device):
         # optimizer/EMA, restart step counter and schedule
         ck = torch.load(args.resume_weights_only, map_location=device,
                         weights_only=False)
-        missing, unexpected = model.load_state_dict(ck["model"], strict=False)
+        missing, unexpected = model.load_state_dict(
+            remap_old_read_keys(ck["model"]), strict=False)
         print(f"weights-only resume from {args.resume_weights_only}: "
               f"{len(missing)} new / {len(unexpected)} skipped params", flush=True)
         for k in missing:
             print(f"  + new: {k}", flush=True)
     elif args.resume:
         ck = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(ck["model"])
+        model.load_state_dict(remap_old_read_keys(ck["model"]))
         opt.load_state_dict(ck["opt"])
         if ema is not None and ck.get("ema") is not None:
             ema = ck["ema"]
@@ -225,7 +291,7 @@ def train(args, device):
     if args.eval_only:
         assert args.resume, "--eval_only requires --resume"
         if ck.get("ema") is not None:
-            model.load_state_dict(ck["ema"])
+            model.load_state_dict(remap_old_read_keys(ck["ema"]))
         model.eval()
         rec = dict(n=args.n, **evaluate(model, args, g_eval, device, 8))
         print(json.dumps(rec), flush=True)
@@ -290,12 +356,18 @@ def train(args, device):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default="stack", choices=["stack", "baseline"])
     ap.add_argument("--task", default="passkey",
                     choices=["passkey", "copying", "mqar", "lm"])
     ap.add_argument("--n", type=int, default=4096)
     ap.add_argument("--b", type=int, default=16)
     ap.add_argument("--d", type=int, default=256)
     ap.add_argument("--heads", type=int, default=4)
+    ap.add_argument("--arch", default=None,
+                    help="stack layer spec, e.g. 'Lx2,G' (default), "
+                         "'Lx2,(G)x4' (read cycling), 'Lx4,Gx2'")
+    ap.add_argument("--layers", type=int, default=3, help="baseline depth")
+    ap.add_argument("--ffn_ratio", type=float, default=4.0)
     ap.add_argument("--bs", type=int, default=16)
     ap.add_argument("--steps", type=int, default=6000)
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -310,10 +382,14 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--read_m", type=int, default=64,
                     help="top-m blocks popped per head")
-    ap.add_argument("--local_layers", type=int, default=2,
-                    help="depth of the local halo encoder")
+    ap.add_argument("--local_layers", type=int, default=None,
+                    help="deprecated alias for --arch Lx{k},G")
     ap.add_argument("--nqueries", type=int, default=4, help="mqar queries per sequence")
     ap.add_argument("--npairs", type=int, default=16, help="mqar pairs per sequence")
+    ap.add_argument("--npairs_density", type=float, default=0.0,
+                    help="mqar pairs per token (overrides --npairs, scales with n)")
+    ap.add_argument("--nkeytoks", type=int, default=1, choices=[1, 2],
+                    help="mqar key length in tokens (2 -> 4096 distinct keys)")
     ap.add_argument("--stop_exact", type=float, default=None,
                     help="early stop + save when eval_exact >= this (0..1)")
     ap.add_argument("--tag", default=None)
@@ -322,7 +398,7 @@ def main():
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
     if args.tag is None:
-        args.tag = f"stack_{args.task}_n{args.n}_s{args.seed}"
+        args.tag = f"{args.model}_{args.task}_n{args.n}_s{args.seed}"
     device = get_device()
     if args.selftest:
         leak_test()

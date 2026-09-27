@@ -20,6 +20,17 @@ small-n ignition behave like a plain transformer). The gate is the harsh
 log_softmax over block scores (near-binary margins are G-invariant; relaxed
 gates destroy extrapolation).
 
+Architecture spec (arch): a comma string of L (local halo encoder block) and
+G (global read round) items. `XxN` = N independently-weighted X layers;
+`(X)xN` = N passes of one weight-shared X layer (cycling adds compute passes,
+not parameters). All L must precede all G (encode -> read). Examples:
+"Lx2,G" (default, == the original 2-local + 1-read model), "Lx2,(G)x4"
+(read-side cycling), "Lx4,Gx2" (both sides deeper, independent weights).
+
+All G rounds share one raw K/V (written ONCE after the last L and never
+rewritten) and one push/top-m/gate/pop machinery; only the query-side state z
+evolves across rounds: z <- z + read_out(ctx(z)); z <- z + ffn(z).
+
 KV-cache story: raw K/V is written once at token granularity and never
 rewritten; the push pass only READS cached keys, the pop pass reads cached
 K/V of selected blocks + the local window. Nothing else is stored.
@@ -27,6 +38,12 @@ K/V of selected blocks + the local window. Nothing else is stored.
 Causality: position t (block k) reads the local window [(k-1)*b, t] directly
 and may select blocks j <= k-2 (fully covered, strictly in the past); block
 k-1 is covered by the local window and needs no selection.
+
+Dense fast path: when topk >= total blocks, every visible block is selected,
+the candidate set is exactly the causal prefix [0, t], and push+pop collapse
+into a single causal attention with a per-block gate bias (one score matmul
+serves both the block partition functions and the fine read). Numerically
+equivalent to the sparse path (guarded by tests), much cheaper at small n.
 
 sup: optional [B,N] bool loss mask — push/pop runs only at supervised
 positions (retrieval tasks: a handful per sequence); sup=None supervises all
@@ -45,39 +62,105 @@ from .blocks import (HaloMemoryBlock, RotaryEmbedding, FeedForward,
                      KVProjection, _gather_heads)
 
 
+def parse_arch(arch):
+    """'Lx2,(G)x4' -> [(kind, count, shared), ...] in application order.
+
+    L = local halo encoder block; G = global read round. `XxN` repeats X with
+    independent weights, `(X)xN` cycles one shared-weight X. All L must
+    precede all G (encode -> read); bare `X` means `Xx1`.
+    """
+    if not isinstance(arch, str) or not arch.strip():
+        raise ValueError("arch must be a nonempty spec like 'Lx2,G'")
+    spec = []
+    for item in arch.split(","):
+        item = item.strip()
+        shared = item.startswith("(")
+        if shared:
+            kind, sep, count = item[1:].partition(")x")
+            if not sep:
+                raise ValueError(f"shared layers must look like '(X)xN': {item!r}")
+        else:
+            kind, _, count = item.partition("x")
+            count = count or "1"
+        if kind not in ("L", "G"):
+            raise ValueError(f"unknown layer kind in arch item {item!r} (want L or G)")
+        if not count.isdigit() or int(count) < 1:
+            raise ValueError(f"repeat count must be a positive integer in {item!r}")
+        spec.append((kind, int(count), shared))
+    kinds = [k for k, _, _ in spec]
+    if "G" in kinds and "L" in kinds:
+        first_g = kinds.index("G")
+        last_l = len(kinds) - 1 - kinds[::-1].index("L")
+        if first_g < last_l:
+            raise ValueError("all L layers must precede all G layers (encode -> read)")
+    return spec
+
+
+class GlobalReadBlock(nn.Module):
+    """One global read round's parameters (query norm/proj, readout, FFN).
+
+    The push/top-m/gate/pop plumbing lives in StackModel because raw K/V are
+    shared across all rounds and never rewritten; this block only owns the
+    query-side weights that turn the current z into a query and absorb the
+    retrieved context.
+    """
+
+    def __init__(self, dim, ffn_ratio):
+        super().__init__()
+        self.q_norm = nn.LayerNorm(dim)
+        self.wq = nn.Linear(dim, dim, bias=False)
+        self.read_out = nn.Linear(dim, dim, bias=False)
+        self.ffn_norm = nn.LayerNorm(dim)
+        self.ffn = FeedForward(dim, ffn_ratio)
+
+
 class StackModel(nn.Module):
     """forward([B,N], sup=None) -> [B,N,vocab_size]."""
 
     def __init__(self, vocab_size, dim=256, heads=4, block_size=16, topk=64,
-                 local_layers=2, ffn_ratio=4, pos_chunk=256):
+                 arch=None, local_layers=None, ffn_ratio=4, pos_chunk=0):
         super().__init__()
         integers = {"vocab_size": vocab_size, "dim": dim, "heads": heads,
-                    "block_size": block_size, "topk": topk,
-                    "local_layers": local_layers, "pos_chunk": pos_chunk}
+                    "block_size": block_size, "topk": topk}
         for name, value in integers.items():
             if isinstance(value, bool) or not isinstance(value, Integral) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
+        if isinstance(pos_chunk, bool) or not isinstance(pos_chunk, Integral) \
+                or pos_chunk < 0:
+            raise ValueError("pos_chunk must be a non-negative integer (0 = auto)")
         if block_size < 2:
             raise ValueError("block_size must be at least 2")
         if dim % heads or (dim // heads) % 2:
             raise ValueError("dim / heads must be an even integer for RoPE")
         if not math.isfinite(ffn_ratio) or ffn_ratio <= 0:
             raise ValueError("ffn_ratio must be finite and positive")
+        if arch is None:
+            arch = f"Lx{local_layers if local_layers is not None else 2},G"
         self.dim, self.heads, self.hd = dim, heads, dim // heads
         self.block_size, self.topk, self.pos_chunk = block_size, topk, pos_chunk
+        self.arch = arch
         self.embedding = nn.Embedding(vocab_size, dim)
         nn.init.normal_(self.embedding.weight, std=0.02)
         self.rope = RotaryEmbedding(self.hd)
-        self.local = nn.ModuleList(
-            HaloMemoryBlock(dim, heads, block_size, self.rope, ffn_ratio,
-                            query_chunk_size=64)
-            for _ in range(local_layers))
+        shared = {}
+        local, reads = [], []
+        for kind, count, is_shared in parse_arch(arch):
+            for _ in range(count):
+                key = kind if is_shared else None
+                if key is not None and key in shared:
+                    mod = shared[key]
+                else:
+                    if kind == "L":
+                        mod = HaloMemoryBlock(dim, heads, block_size, self.rope,
+                                              ffn_ratio, query_chunk_size=64)
+                    else:
+                        mod = GlobalReadBlock(dim, ffn_ratio)
+                    if key is not None:
+                        shared[key] = mod
+                (local if kind == "L" else reads).append(mod)
+        self.local = nn.ModuleList(local)
+        self.reads = nn.ModuleList(reads)
         self.raw_kv = KVProjection(dim, heads, self.rope, use_rope=False)
-        self.q_norm = nn.LayerNorm(dim)
-        self.wq = nn.Linear(dim, dim, bias=False)
-        self.read_out = nn.Linear(dim, dim, bias=False)
-        self.ffn_norm = nn.LayerNorm(dim)
-        self.ffn = FeedForward(dim, ffn_ratio)
         self.final_norm = nn.LayerNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
         self.lm_head.weight = self.embedding.weight
@@ -110,11 +193,94 @@ class StackModel(nn.Module):
         """PUSH: exact per-block attention partition function.
 
         q [B,c,H,hd]; kb [B,G,b,H,hd]; visible [B,c,G] ->
-        block scores [B,c,H,G] (masked -inf), token scores [B,c,H,G,b]."""
+        block scores [B,c,H,G] (masked -inf)."""
         ts = torch.einsum('bchd,bgwhd->bchgw', q, kb) / math.sqrt(self.hd)
         s = ts.logsumexp(-1)
         s = s.masked_fill(~visible[:, :, None, :], float('-inf'))
         return s
+
+    def _chunk_size(self, n):
+        """Supervised positions per chunk; auto mode bounds temporaries."""
+        if self.pos_chunk > 0:
+            return self.pos_chunk
+        return min(256, max(16, (1 << 24) // max(n, 1)))
+
+    def _read_round_sparse(self, rd, z, sl, env):
+        """One G round, exact top-m plumbing (general case)."""
+        batch, cnt, _ = z.shape
+        n, b, groups = env["n"], env["b"], env["groups"]
+        pos_c = env["pos"][:, sl]
+        q = rd.wq(rd.q_norm(z)).reshape(batch, cnt, self.heads, self.hd)
+        s = self.push_scores(q, env["kb"], env["visible"][:, sl])  # [B,c,H,G]
+        with torch.no_grad():
+            keep = min(self.topk, groups)
+            top, sel = s.topk(keep, dim=-1)
+            sel_ok = torch.isfinite(top)
+        gate = torch.nan_to_num(s - s.logsumexp(-1, keepdim=True),
+                                nan=0.0, neginf=0.0)
+        gate_sel = torch.gather(gate, 3, sel)
+        gate_sel = torch.where(sel_ok, gate_sel,
+                               torch.zeros((), dtype=gate.dtype, device=gate.device))
+        # POP: expand selected blocks into raw tokens, per head
+        tok = sel[..., None] * b + torch.arange(b, device=z.device)
+        tok = tok.reshape(batch, cnt, self.heads, -1)              # [B,c,H,m*b]
+        tok_ok = (sel_ok[..., None].expand(-1, -1, -1, -1, b)
+                  .reshape(batch, cnt, self.heads, -1)
+                  & (tok < n) & (tok <= pos_c[:, :, None, None]))
+        k_rem = _gather_heads(env["raw_k"].transpose(1, 2),
+                              tok.clamp(0, n - 1).permute(0, 2, 1, 3))
+        v_rem = _gather_heads(env["raw_v"].transpose(1, 2),
+                              tok.clamp(0, n - 1).permute(0, 2, 1, 3))
+        k_rem = k_rem.permute(0, 2, 1, 3, 4)                       # [B,c,H,m*b,hd]
+        v_rem = v_rem.permute(0, 2, 1, 3, 4)
+        bias = gate_sel[..., None].expand(-1, -1, -1, -1, b)
+        bias = bias.reshape(batch, cnt, self.heads, -1)
+        s_loc = torch.einsum('bchd,bcwhd->bchw', q,
+                             env["k_loc"][:, sl]) / math.sqrt(self.hd)
+        s_rem = torch.einsum('bchd,bchkd->bchk', q, k_rem) \
+            / math.sqrt(self.hd) + bias
+        all_scores = torch.cat([s_loc, s_rem], dim=-1)
+        mask = torch.cat([env["src_valid"][:, sl, None]
+                          .expand(-1, -1, self.heads, -1), tok_ok], dim=-1)
+        probs = all_scores.masked_fill(~mask, float('-inf')).softmax(-1)
+        width = s_loc.shape[-1]
+        ctx = torch.einsum('bchw,bcwhd->bchd', probs[..., :width],
+                           env["v_loc"][:, sl]) \
+            + torch.einsum('bchk,bchkd->bchd', probs[..., width:], v_rem)
+        ctx = ctx.reshape(batch, cnt, self.dim)
+        z = z + rd.read_out(ctx)
+        return z + rd.ffn(rd.ffn_norm(z))
+
+    def _read_round_dense(self, rd, z, sl, env):
+        """One G round when topk >= groups: the candidate set is exactly the
+        causal prefix [0, t], so push and pop collapse into a single causal
+        attention with a per-block gate bias. One q.K^T serves both the block
+        partition functions and the fine read."""
+        batch, cnt, _ = z.shape
+        n, b, groups, pad = env["n"], env["b"], env["groups"], env["pad"]
+        pos_c = env["pos"][:, sl]
+        q = rd.wq(rd.q_norm(z)).reshape(batch, cnt, self.heads, self.hd)
+        qh = q.permute(0, 2, 1, 3).reshape(batch * self.heads, cnt, self.hd)
+        kh = env["raw_k"].permute(0, 2, 3, 1).reshape(batch * self.heads,
+                                                      self.hd, n)
+        ts = torch.bmm(qh, kh).view(batch, self.heads, cnt, n) \
+            .permute(0, 2, 1, 3) / math.sqrt(self.hd)             # [B,c,H,n]
+        tsp = F.pad(ts, (0, pad)).view(batch, cnt, self.heads, groups, b)
+        s = tsp.logsumexp(-1)                                     # [B,c,H,G]
+        s = s.masked_fill(~env["visible"][:, sl, None, :], float('-inf'))
+        gate = torch.nan_to_num(s - s.logsumexp(-1, keepdim=True),
+                                nan=0.0, neginf=0.0)
+        bias = gate[:, :, :, env["block_ids"]]                    # [B,c,H,n]
+        causal = pos_c[:, :, None, None] >= env["token_ids"][None, None, None, :]
+        probs = (ts + bias).masked_fill(~causal, float('-inf')).softmax(-1)
+        vh = env["raw_v"].permute(0, 2, 1, 3)                     # [B,H,n,hd]
+        ctx = torch.bmm(probs.permute(0, 2, 1, 3).reshape(batch * self.heads,
+                                                         cnt, n),
+                        vh.reshape(batch * self.heads, n, self.hd))
+        ctx = ctx.view(batch, self.heads, cnt, self.hd) \
+            .permute(0, 2, 1, 3).reshape(batch, cnt, self.dim)
+        z = z + rd.read_out(ctx)
+        return z + rd.ffn(rd.ffn_norm(z))
 
     def forward(self, input_ids, sup=None):
         batch, n = input_ids.shape
@@ -139,59 +305,100 @@ class StackModel(nn.Module):
         indexed_end = (block_of - 1) * b                     # blocks j <= k-2
         visible = cover_end[None, None, :] <= indexed_end[:, :, None]
         rows = torch.arange(batch, device=x.device)[:, None, None]
-        k_loc = raw_k[rows, src.clamp(0, n - 1)]             # [B,S,2b,H,hd]
-        v_loc = raw_v[rows, src.clamp(0, n - 1)]
+        env = dict(n=n, b=b, groups=groups, pad=pad, pos=pos, kb=kb,
+                   visible=visible, raw_k=raw_k, raw_v=raw_v,
+                   k_loc=raw_k[rows, src.clamp(0, n - 1)],
+                   v_loc=raw_v[rows, src.clamp(0, n - 1)],
+                   src_valid=src_valid,
+                   block_ids=torch.arange(n, device=x.device) // b,
+                   token_ids=torch.arange(n, device=x.device))
+        dense = self.topk >= groups
         z_rows = torch.arange(batch, device=x.device)[:, None]
         outs = []
-        for start in range(0, s_n, self.pos_chunk):
-            stop = min(s_n, start + self.pos_chunk)
-            cnt = stop - start
-            pos_c = pos[:, start:stop]
-            x_c = x[z_rows, pos_c]
-            q = self.wq(self.q_norm(x_c)).reshape(batch, cnt, self.heads,
-                                                  self.hd)
-            s = self.push_scores(q, kb, visible[:, start:stop])  # [B,c,H,G]
-            with torch.no_grad():
-                keep = min(self.topk, groups)
-                top, sel = s.topk(keep, dim=-1)
-                sel_ok = torch.isfinite(top)
-            gate = torch.nan_to_num(s - s.logsumexp(-1, keepdim=True),
-                                    nan=0.0, neginf=0.0)
-            gate_sel = torch.gather(gate, 3, sel)
-            gate_sel = torch.where(sel_ok, gate_sel,
-                                   torch.zeros((), dtype=gate.dtype,
-                                               device=gate.device))
-            # POP: expand selected blocks into raw tokens, per head
-            tok = sel[..., None] * b + torch.arange(b, device=x.device)
-            tok = tok.reshape(batch, cnt, self.heads, -1)         # [B,c,H,m*b]
-            tok_ok = (sel_ok[..., None].expand(-1, -1, -1, -1, b)
-                      .reshape(batch, cnt, self.heads, -1)
-                      & (tok < n) & (tok <= pos_c[:, :, None, None]))
-            k_rem = _gather_heads(raw_k.transpose(1, 2),
-                                  tok.clamp(0, n - 1).permute(0, 2, 1, 3))
-            v_rem = _gather_heads(raw_v.transpose(1, 2),
-                                  tok.clamp(0, n - 1).permute(0, 2, 1, 3))
-            k_rem = k_rem.permute(0, 2, 1, 3, 4)                  # [B,c,H,m*b,hd]
-            v_rem = v_rem.permute(0, 2, 1, 3, 4)
-            bias = gate_sel[..., None].expand(-1, -1, -1, -1, b)
-            bias = bias.reshape(batch, cnt, self.heads, -1)
-            s_loc = torch.einsum('bchd,bcwhd->bchw', q,
-                                 k_loc[:, start:stop]) / math.sqrt(self.hd)
-            s_rem = torch.einsum('bchd,bchkd->bchk', q, k_rem) \
-                / math.sqrt(self.hd) + bias
-            all_scores = torch.cat([s_loc, s_rem], dim=-1)
-            mask = torch.cat([src_valid[:, start:stop, None]
-                              .expand(-1, -1, self.heads, -1), tok_ok], dim=-1)
-            probs = all_scores.masked_fill(~mask, float('-inf')).softmax(-1)
-            width = s_loc.shape[-1]
-            ctx = torch.einsum('bchw,bcwhd->bchd', probs[..., :width],
-                               v_loc[:, start:stop]) \
-                + torch.einsum('bchk,bchkd->bchd', probs[..., width:], v_rem)
-            ctx = ctx.reshape(batch, cnt, self.dim)
-            z = x_c + self.read_out(ctx)
-            outs.append(z + self.ffn(self.ffn_norm(z)))
+        chunk = self._chunk_size(n)
+        for start in range(0, s_n, chunk):
+            sl = slice(start, min(s_n, start + chunk))
+            z = x[z_rows, pos[:, sl]]
+            for rd in self.reads:
+                z = (self._read_round_dense if dense
+                     else self._read_round_sparse)(rd, z, sl, env)
+            outs.append(z)
         z = torch.cat(outs, dim=1)
         sup_logits = self.lm_head(self.final_norm(z))
         logits = sup_logits.new_zeros(batch, n, sup_logits.shape[-1])
         logits[z_rows, pos] = sup_logits
         return logits
+
+    @torch.no_grad()
+    def diagnose(self, idx, sup=None, needle_pos=None):
+        """Encode + push only (no pop): selection quality of the first G round.
+
+        Returns sel_cov (attention mass covered by the top-m selected blocks,
+        i.e. 1 - uncovered tail eps), gate_margin (lowest selected block score
+        minus highest unselected visible score), and, when needle_pos [B] is
+        given (passkey), needle_block_hit (fraction of heads whose top-m
+        contains a needle block at the first supervised position, over rows
+        where the needle is outside the local window)."""
+        if not self.reads:
+            return {}
+        self.eval()
+        batch, n = idx.shape
+        b = self.block_size
+        groups = (n + b - 1) // b
+        x, raw_k, _ = self.encode(idx)
+        pos, s_n = self.supervised_positions(sup, n)
+        if pos is None:
+            pos = torch.arange(n, device=x.device)[None].expand(batch, n)
+        block_of = pos // b
+        pad = groups * b - n
+        kb = F.pad(raw_k, (0, 0, 0, 0, 0, pad)).reshape(batch, groups, b,
+                                                        self.heads, self.hd)
+        cover_end = (torch.arange(groups, device=x.device) + 1) * b
+        visible = cover_end[None, None, :] <= ((block_of - 1) * b)[:, :, None]
+        rd = self.reads[0]
+        z_rows = torch.arange(batch, device=x.device)[:, None]
+        keep = min(self.topk, groups)
+        cov_sum = cov_cnt = mar_sum = mar_cnt = 0.0
+        hit_sum = hit_cnt = 0.0
+        for start in range(0, s_n, self._chunk_size(n)):
+            stop = min(s_n, start + self._chunk_size(n))
+            cnt = stop - start
+            vis = visible[:, start:stop]                        # [B,c,G]
+            z = x[z_rows, pos[:, start:stop]]
+            q = rd.wq(rd.q_norm(z)).reshape(batch, cnt, self.heads, self.hd)
+            s = self.push_scores(q, kb, vis)                    # [B,c,H,G]
+            top, sel = s.topk(keep, dim=-1)
+            sel_ok = torch.isfinite(top)
+            p = s.softmax(-1)                                   # nan if no visible
+            p_sel = torch.where(sel_ok, p.gather(3, sel),
+                                torch.zeros((), dtype=p.dtype, device=p.device))
+            cov = p_sel.sum(-1)                                 # [B,c,H]
+            has_vis = vis.any(-1, keepdim=True)                 # [B,c,1]
+            cov_sum += cov[has_vis.expand_as(cov)].sum().item()
+            cov_cnt += has_vis.sum().item() * self.heads
+            sel_mask = torch.zeros_like(s, dtype=torch.bool).scatter(3, sel, sel_ok)
+            unsel_vis = vis[:, :, None, :] & ~sel_mask
+            s_sel_min = s.masked_fill(~sel_mask, float('inf')).min(-1).values
+            s_unsel_max = s.masked_fill(~unsel_vis, float('-inf')).max(-1).values
+            mvalid = sel_mask.any(-1) & unsel_vis.any(-1)       # [B,c,H]
+            mar_sum += (s_sel_min - s_unsel_max)[mvalid].sum().item()
+            mar_cnt += mvalid.sum().item()
+            if needle_pos is not None and start == 0:
+                nb = (needle_pos.to(x.device)[:, None]
+                      + torch.arange(6, device=x.device)) // b  # [B,6]
+                k0 = int(pos[0, 0]) // b
+                past = nb.max(-1).values <= k0 - 2              # outside local window
+                if past.any():
+                    at0 = sel_mask[:, 0]                        # [B,H,G]
+                    hits = at0.gather(2, nb[:, None, :]
+                                      .expand(-1, self.heads, -1)).any(-1)
+                    hit_sum += hits[past].float().mean(-1).sum().item()
+                    hit_cnt += int(past.sum().item())
+        rec = {}
+        if cov_cnt:
+            rec["sel_cov"] = round(cov_sum / cov_cnt, 4)
+        if mar_cnt:
+            rec["gate_margin"] = round(mar_sum / mar_cnt, 4)
+        if hit_cnt:
+            rec["needle_block_hit"] = round(hit_sum / hit_cnt, 4)
+        return rec

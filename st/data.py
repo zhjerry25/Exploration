@@ -11,12 +11,18 @@ passkey: filler with a needle [P, d1..d5] at a random position and
 copying: [pattern c tokens][SEP][filler][SEP][pattern]; loss on last c.
 
 mqar: n_pairs key->value pairs [(k_i, v_i)] spaced through filler, then
-[Q, k, v] x n_queries at the end; loss on the query values. Keys are 64
-dedicated tokens (34-97) sampled WITHOUT replacement (a permutation per
-sequence) -- an earlier version drew pairs with replacement from too few
-keys, making targets contradictory (same key, different values) and
+[Q, k, v] x n_queries at the end; loss on the query values. Keys are
+sampled WITHOUT replacement from a dedicated token alphabet (a permutation
+per sequence) -- an earlier version drew pairs with replacement from too
+few keys, making targets contradictory (same key, different values) and
 freezing the loss at ln(10). Fillers are 26-29 for this task only
 (passkey/copying keep 18-29); values are digits.
+
+key_tokens=1 (default): single-token keys from 64 tokens (34-97), layout
+[k, v] / query [Q, k]. key_tokens=2: two-token keys from the same alphabet
+(64^2 = 4096 distinct keys) for density-scaled long-context benchmarks,
+layout [k1, k2, v] / query [Q, k1, k2]. key_tokens=1 reproduces the
+original batch stream bit-identically.
 """
 import torch
 
@@ -65,27 +71,43 @@ def copying_batch(bs, n, g, device, c=None):
     return idx.to(device), tgt.to(device), mask.to(device), None
 
 
-def mqar_batch(bs, n, g, device, n_pairs=16, n_queries=4):
-    assert n_pairs <= len(MQAR_KEYS), \
-        f"n_pairs={n_pairs} > {len(MQAR_KEYS)} distinct keys"
-    tail = 3 * n_queries
+def resolve_npairs(n, n_pairs, density):
+    """Fixed pair count, or n-scaled count when density > 0 (pairs ~ n*density)."""
+    if density and density > 0:
+        return max(1, round(n * density))
+    return n_pairs
+
+
+def mqar_batch(bs, n, g, device, n_pairs=16, n_queries=4, key_tokens=1):
+    n_keys = len(MQAR_KEYS) ** key_tokens
+    assert n_pairs <= n_keys, \
+        f"n_pairs={n_pairs} > {n_keys} distinct keys"
+    stride = key_tokens + 2
+    tail = stride * n_queries
     seq = torch.randint(MQAR_FILL0, MQAR_FILL1, (bs, n + 1), generator=g)
     seg = (n + 1 - tail) // n_pairs
-    assert seg >= 2, "sequence too short for n_pairs"
-    ki = torch.argsort(torch.rand(bs, len(MQAR_KEYS), generator=g), dim=1)[:, :n_pairs]
-    keys = MQAR_KEYS[0] + ki  # unique keys per sequence (no-replacement)
+    assert seg >= key_tokens + 1, "sequence too short for n_pairs"
+    kid = torch.argsort(torch.rand(bs, n_keys, generator=g), dim=1)[:, :n_pairs]
+    comps = []
+    for j in range(key_tokens):
+        comps.append(MQAR_KEYS[0]
+                     + kid // (len(MQAR_KEYS) ** (key_tokens - 1 - j))
+                     % len(MQAR_KEYS))
+    keys = torch.stack(comps, -1)  # unique key tuples per sequence [bs,np,kt]
     vals = torch.randint(0, 10, (bs, n_pairs), generator=g)
-    off = torch.randint(0, seg - 1, (bs, n_pairs), generator=g)
+    off = torch.randint(0, seg - key_tokens, (bs, n_pairs), generator=g)
     p = torch.arange(n_pairs).unsqueeze(0) * seg + off  # (bs, n_pairs)
     rows = torch.arange(bs).unsqueeze(1)
-    seq[rows, p] = keys
-    seq[rows, p + 1] = vals
+    for j in range(key_tokens):
+        seq[rows, p + j] = keys[..., j]
+    seq[rows, p + key_tokens] = vals
     qi = torch.randint(0, n_pairs, (bs, n_queries), generator=g)
     t = n + 1 - tail
-    seq[:, t::3] = Q
-    seq[:, t + 1::3] = keys.gather(1, qi)
-    seq[:, t + 2::3] = vals.gather(1, qi)
+    seq[:, t::stride] = Q
+    for j in range(key_tokens):
+        seq[:, t + 1 + j::stride] = keys[..., j].gather(1, qi)
+    seq[:, t + 1 + key_tokens::stride] = vals.gather(1, qi)
     idx, tgt = seq[:, :-1], seq[:, 1:]
     mask = torch.zeros(bs, n, dtype=torch.bool)
-    mask[:, t + 1::3] = True  # tgt positions predicting each value (after [Q,k])
+    mask[:, t + key_tokens::stride] = True  # tgt positions predicting each value
     return idx.to(device), tgt.to(device), mask.to(device), None
