@@ -17,6 +17,14 @@ sequence) -- an earlier version drew pairs with replacement from too few
 keys, making targets contradictory (same key, different values) and
 freezing the loss at ln(10). Fillers are 26-29 for this task only
 (passkey/copying keep 18-29); values are digits.
+
+mqar2 (two-hop MQAR): chains a_i -> b_i -> c_i. First half of the body
+hosts (a_i, b_i) pairs, second half (b_i, c_i) pairs; tail is [Q, a_i, c_i]
+x n_queries with loss on c_i. a-keys 34-97, b-mids 98-161 (same token is
+hop-1 value and hop-2 key -- that IS the chain), c-values digits 0-9, vocab
+192. Queries are sampled WITHOUT replacement per sequence so no answer is
+ever visible earlier in the tail. A single-read model (1 layer, 1 round)
+cannot express the chain; 2 rounds or 2 layers can.
 """
 import torch
 
@@ -26,6 +34,8 @@ VOCAB = 128  # 0-9 digits, 18-29 filler, 30-32 P/Q/SEP, 34-97 MQAR keys
 KEY = 5
 MQAR_KEYS = list(range(34, 98))  # 64 distinct keys (npairs <= 64)
 MQAR_FILL0, MQAR_FILL1 = 26, 30  # mqar-only fillers (26..29)
+MQAR2_BMIDS = list(range(98, 162))  # 64 distinct b-mids
+MQAR2_VOCAB = 192
 
 
 def _targets(seq, loss_len):
@@ -88,4 +98,43 @@ def mqar_batch(bs, n, g, device, n_pairs=16, n_queries=4):
     idx, tgt = seq[:, :-1], seq[:, 1:]
     mask = torch.zeros(bs, n, dtype=torch.bool)
     mask[:, t + 1::3] = True  # tgt positions predicting each value (after [Q,k])
+    return idx.to(device), tgt.to(device), mask.to(device), None
+
+
+def mqar2_batch(bs, n, g, device, n_pairs=16, n_queries=4):
+    """Two-hop MQAR: a_i -> b_i in the first body half, b_i -> c_i in the
+    second; tail queries [Q, a_i, c_i], loss on c_i. Answering requires
+    chaining: read a->b, then use b to read b->c. Queries are a permutation
+    (no replacement) so answers never leak into the visible tail."""
+    assert n_pairs <= len(MQAR_KEYS), \
+        f"n_pairs={n_pairs} > {len(MQAR_KEYS)} distinct keys"
+    tail = 3 * n_queries
+    body = n + 1 - tail
+    half = body // 2
+    seg1 = half // n_pairs
+    seg2 = (body - half) // n_pairs
+    assert seg1 >= 2 and seg2 >= 2, "sequence too short for n_pairs"
+    seq = torch.randint(MQAR_FILL0, MQAR_FILL1, (bs, n + 1), generator=g)
+    ai = torch.argsort(torch.rand(bs, len(MQAR_KEYS), generator=g), dim=1)[:, :n_pairs]
+    bi = torch.argsort(torch.rand(bs, len(MQAR2_BMIDS), generator=g), dim=1)[:, :n_pairs]
+    akeys = MQAR_KEYS[0] + ai                       # (bs, n_pairs) unique
+    bmids = MQAR2_BMIDS[0] + bi                     # (bs, n_pairs) unique
+    cvals = torch.randint(0, 10, (bs, n_pairs), generator=g)
+    rows = torch.arange(bs).unsqueeze(1)
+    off1 = torch.randint(0, seg1 - 1, (bs, n_pairs), generator=g)
+    p1 = torch.arange(n_pairs).unsqueeze(0) * seg1 + off1
+    seq[rows, p1] = akeys                           # a_i -> b_i, first half
+    seq[rows, p1 + 1] = bmids
+    off2 = torch.randint(0, seg2 - 1, (bs, n_pairs), generator=g)
+    p2 = half + torch.arange(n_pairs).unsqueeze(0) * seg2 + off2
+    seq[rows, p2] = bmids                           # b_i -> c_i, second half
+    seq[rows, p2 + 1] = cvals
+    qi = torch.argsort(torch.rand(bs, n_pairs, generator=g), dim=1)[:, :n_queries]
+    t = n + 1 - tail
+    seq[:, t::3] = Q
+    seq[:, t + 1::3] = akeys.gather(1, qi)
+    seq[:, t + 2::3] = cvals.gather(1, qi)
+    idx, tgt = seq[:, :-1], seq[:, 1:]
+    mask = torch.zeros(bs, n, dtype=torch.bool)
+    mask[:, t + 1::3] = True  # tgt positions predicting each c (after [Q,a])
     return idx.to(device), tgt.to(device), mask.to(device), None

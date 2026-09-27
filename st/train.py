@@ -21,6 +21,11 @@ Usage:
       --lr 5e-4 --bf16 --p_mode ones --no_write_gelu --rc 64   # baseline
   python -m st.train --arch psr --task lm --n 4096 --steps 15000 --bs 16 \
       --lr 5e-4 --bf16 --rc 128                                 # PSR default
+  # iterative readout (--arch irt): T=1 is the plain transformer
+  python -m st.train --arch irt --task mqar2 --n 256 --npairs 16 --nqueries 8 \
+      --layers 1 --read_rounds 2 --steps 3000 --bs 32 --lr 1e-3
+  python -m st.train --arch irt --task lm --n 4096 --steps 15000 --bs 16 \
+      --lr 5e-4 --bf16 --layers 6 --read_rounds 2
 """
 import argparse
 import contextlib
@@ -36,9 +41,10 @@ from . import data
 from . import lmdata
 from .stack_model import StackModel
 from .psr_model import PSRModel
+from .irt_model import IRTModel
 
 VOCABS = {"passkey": data.VOCAB, "copying": data.VOCAB, "mqar": data.VOCAB,
-          "lm": 256}
+          "mqar2": data.MQAR2_VOCAB, "lm": 256}
 
 
 def get_device():
@@ -57,7 +63,8 @@ def amp_ctx(args, device):
 
 def build(args, device="cpu"):
     vocab = VOCABS.get(getattr(args, "task", "passkey"), data.VOCAB)
-    if getattr(args, "arch", "stack") == "psr":
+    arch = getattr(args, "arch", "stack")
+    if arch == "psr":
         m = PSRModel(vocab, dim=args.d, heads=args.heads,
                      layers=getattr(args, "layers", 6),
                      d_a=getattr(args, "da", None), r_c=getattr(args, "rc", None),
@@ -66,6 +73,11 @@ def build(args, device="cpu"):
                      ffn_ratio=getattr(args, "ffn_ratio", 4.0))
         if device.type == "cuda":
             probe_psr_sdpa(m, device)
+    elif arch == "irt":
+        m = IRTModel(vocab, dim=args.d, heads=args.heads,
+                     layers=getattr(args, "layers", 6),
+                     read_rounds=getattr(args, "read_rounds", 2),
+                     ffn_ratio=getattr(args, "ffn_ratio", 4.0))
     else:
         m = StackModel(vocab, dim=args.d, heads=args.heads, block_size=args.b,
                        topk=getattr(args, "read_m", 64),
@@ -102,6 +114,10 @@ def make_batch(args, g, device, n=None, split="train"):
         return data.mqar_batch(args.bs, n or args.n, g, device,
                                n_pairs=getattr(args, "npairs", 16),
                                n_queries=getattr(args, "nqueries", 4))
+    if args.task == "mqar2":
+        return data.mqar2_batch(args.bs, n or args.n, g, device,
+                                n_pairs=getattr(args, "npairs", 16),
+                                n_queries=getattr(args, "nqueries", 4))
     return BATCHERS[args.task](args.bs, n or args.n, g, device)
 
 
@@ -344,7 +360,7 @@ def train(args, device):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--task", default="passkey",
-                    choices=["passkey", "copying", "mqar", "lm"])
+                    choices=["passkey", "copying", "mqar", "mqar2", "lm"])
     ap.add_argument("--n", type=int, default=4096)
     ap.add_argument("--b", type=int, default=16)
     ap.add_argument("--d", type=int, default=256)
@@ -373,8 +389,10 @@ def main():
     ap.add_argument("--eval_only", action="store_true",
                     help="load --resume checkpoint, eval once at args.n, exit")
     ap.add_argument("--selftest", action="store_true")
-    ap.add_argument("--arch", default="stack", choices=["stack", "psr"])
-    ap.add_argument("--layers", type=int, default=6, help="psr block count")
+    ap.add_argument("--arch", default="stack", choices=["stack", "psr", "irt"])
+    ap.add_argument("--layers", type=int, default=6, help="psr/irt block count")
+    ap.add_argument("--read_rounds", type=int, default=2,
+                    help="irt read rounds per block (1 = plain transformer)")
     ap.add_argument("--rc", type=int, default=None,
                     help="psr content width per head (default: dim//heads)")
     ap.add_argument("--da", type=int, default=None,
