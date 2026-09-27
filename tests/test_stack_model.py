@@ -169,6 +169,24 @@ class StackModelTests(unittest.TestCase):
             if p.grad is not None:
                 self.assertTrue(torch.isfinite(p.grad).all())
 
+    def test_grad_ckpt_matches_direct(self):
+        """Checkpointed read rounds must produce identical logits and grads."""
+        torch.manual_seed(7)
+        ref = model(grad_ckpt=False).double()
+        ck = model(grad_ckpt=True).double()
+        ck.load_state_dict(ref.state_dict())
+        ids = torch.randint(31, (2, 21))
+        sup = torch.zeros(2, 21, dtype=torch.bool)
+        sup[:, -4:] = True
+        ref.train(), ck.train()
+        out_r, out_c = ref(ids, sup=sup), ck(ids, sup=sup)
+        torch.testing.assert_close(out_c, out_r, rtol=1e-9, atol=1e-10)
+        probe = torch.randn(2, 21, 31, dtype=torch.double)
+        gr = torch.autograd.grad((out_r * probe).sum(), ref.parameters())
+        gc = torch.autograd.grad((out_c * probe).sum(), ck.parameters())
+        for a, e in zip(gc, gr):
+            torch.testing.assert_close(a, e, rtol=1e-8, atol=1e-9)
+
     def test_shared_weight_cycling(self):
         shared = model(arch="L,(G)x2")
         self.assertIs(shared.reads[0], shared.reads[1])

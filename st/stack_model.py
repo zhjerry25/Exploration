@@ -45,6 +45,16 @@ into a single causal attention with a per-block gate bias (one score matmul
 serves both the block partition functions and the fine read). Numerically
 equivalent to the sparse path (guarded by tests), much cheaper at small n.
 
+Memory: the sparse read materialises ~H*(n + 2*m*b*hd) temporaries per
+supervised position (push scores + per-head block gathers), which autograd
+would retain across ALL chunks until the single backward — ~90GB at
+n=4096/bs16. During training each read round therefore runs under
+torch.utils.checkpoint (grad_ckpt=True, default): only the round input z is
+kept, chunk temporaries are recomputed during backward. Peak drops to one
+chunk's temporaries (~5GB at bs16) at the cost of one extra read-side
+forward. Disable (--grad_ckpt 0) on >=80GB cards for full speed. The read
+path is RNG-free, so recomputation is exact.
+
 sup: optional [B,N] bool loss mask — push/pop runs only at supervised
 positions (retrieval tasks: a handful per sequence); sup=None supervises all
 positions (leak tests, LM). Logits at unsupervised positions are zero.
@@ -57,6 +67,7 @@ from numbers import Integral
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .blocks import (HaloMemoryBlock, RotaryEmbedding, FeedForward,
                      KVProjection, _gather_heads)
@@ -118,7 +129,8 @@ class StackModel(nn.Module):
     """forward([B,N], sup=None) -> [B,N,vocab_size]."""
 
     def __init__(self, vocab_size, dim=256, heads=4, block_size=16, topk=64,
-                 arch=None, local_layers=None, ffn_ratio=4, pos_chunk=0):
+                 arch=None, local_layers=None, ffn_ratio=4, pos_chunk=0,
+                 grad_ckpt=True):
         super().__init__()
         integers = {"vocab_size": vocab_size, "dim": dim, "heads": heads,
                     "block_size": block_size, "topk": topk}
@@ -138,6 +150,7 @@ class StackModel(nn.Module):
             arch = f"Lx{local_layers if local_layers is not None else 2},G"
         self.dim, self.heads, self.hd = dim, heads, dim // heads
         self.block_size, self.topk, self.pos_chunk = block_size, topk, pos_chunk
+        self.grad_ckpt = bool(grad_ckpt)
         self.arch = arch
         self.embedding = nn.Embedding(vocab_size, dim)
         nn.init.normal_(self.embedding.weight, std=0.02)
@@ -200,16 +213,27 @@ class StackModel(nn.Module):
         return s
 
     def _chunk_size(self, n):
-        """Supervised positions per chunk; auto mode bounds temporaries."""
+        """Supervised positions per chunk; auto mode bounds the biggest
+        temporary (push scores ~ H*n elems/pos, gathers ~ 2*H*m*b*hd
+        elems/pos) to ~2^28 elements (~0.5GB bf16)."""
         if self.pos_chunk > 0:
             return self.pos_chunk
-        return min(256, max(16, (1 << 24) // max(n, 1)))
+        groups = (n + self.block_size - 1) // self.block_size
+        m = min(self.topk, groups)
+        elems_per_pos = self.heads * (n + 2 * m * self.block_size * self.hd)
+        return min(256, max(16, (1 << 28) // max(elems_per_pos, 1)))
 
     def _read_round_sparse(self, rd, z, sl, env):
-        """One G round, exact top-m plumbing (general case)."""
+        """One G round, exact top-m plumbing (general case). The local-window
+        gathers are sliced per chunk here (not hoisted) so checkpoint
+        recomputation owns them."""
         batch, cnt, _ = z.shape
         n, b, groups = env["n"], env["b"], env["groups"]
         pos_c = env["pos"][:, sl]
+        src_c = env["src"][:, sl]                                # [B,c,2b]
+        rows = env["rows3"]
+        k_loc = env["raw_k"][rows, src_c.clamp(0, n - 1)]        # [B,c,2b,H,hd]
+        v_loc = env["raw_v"][rows, src_c.clamp(0, n - 1)]
         q = rd.wq(rd.q_norm(z)).reshape(batch, cnt, self.heads, self.hd)
         s = self.push_scores(q, env["kb"], env["visible"][:, sl])  # [B,c,H,G]
         with torch.no_grad():
@@ -236,7 +260,7 @@ class StackModel(nn.Module):
         bias = gate_sel[..., None].expand(-1, -1, -1, -1, b)
         bias = bias.reshape(batch, cnt, self.heads, -1)
         s_loc = torch.einsum('bchd,bcwhd->bchw', q,
-                             env["k_loc"][:, sl]) / math.sqrt(self.hd)
+                             k_loc) / math.sqrt(self.hd)
         s_rem = torch.einsum('bchd,bchkd->bchk', q, k_rem) \
             / math.sqrt(self.hd) + bias
         all_scores = torch.cat([s_loc, s_rem], dim=-1)
@@ -245,7 +269,7 @@ class StackModel(nn.Module):
         probs = all_scores.masked_fill(~mask, float('-inf')).softmax(-1)
         width = s_loc.shape[-1]
         ctx = torch.einsum('bchw,bcwhd->bchd', probs[..., :width],
-                           env["v_loc"][:, sl]) \
+                           v_loc) \
             + torch.einsum('bchk,bchkd->bchd', probs[..., width:], v_rem)
         ctx = ctx.reshape(batch, cnt, self.dim)
         z = z + rd.read_out(ctx)
@@ -304,15 +328,14 @@ class StackModel(nn.Module):
         cover_end = (torch.arange(groups, device=x.device) + 1) * b
         indexed_end = (block_of - 1) * b                     # blocks j <= k-2
         visible = cover_end[None, None, :] <= indexed_end[:, :, None]
-        rows = torch.arange(batch, device=x.device)[:, None, None]
         env = dict(n=n, b=b, groups=groups, pad=pad, pos=pos, kb=kb,
                    visible=visible, raw_k=raw_k, raw_v=raw_v,
-                   k_loc=raw_k[rows, src.clamp(0, n - 1)],
-                   v_loc=raw_v[rows, src.clamp(0, n - 1)],
-                   src_valid=src_valid,
+                   src=src, src_valid=src_valid,
+                   rows3=torch.arange(batch, device=x.device)[:, None, None],
                    block_ids=torch.arange(n, device=x.device) // b,
                    token_ids=torch.arange(n, device=x.device))
         dense = self.topk >= groups
+        round_fn = self._read_round_dense if dense else self._read_round_sparse
         z_rows = torch.arange(batch, device=x.device)[:, None]
         outs = []
         chunk = self._chunk_size(n)
@@ -320,8 +343,13 @@ class StackModel(nn.Module):
             sl = slice(start, min(s_n, start + chunk))
             z = x[z_rows, pos[:, sl]]
             for rd in self.reads:
-                z = (self._read_round_dense if dense
-                     else self._read_round_sparse)(rd, z, sl, env)
+                if self.grad_ckpt and self.training and torch.is_grad_enabled():
+                    # keep only z across chunks; recompute the big temporaries
+                    # (push scores, per-head gathers) during backward
+                    z = checkpoint(round_fn, rd, z, sl, env,
+                                   use_reentrant=False)
+                else:
+                    z = round_fn(rd, z, sl, env)
             outs.append(z)
         z = torch.cat(outs, dim=1)
         sup_logits = self.lm_head(self.final_norm(z))

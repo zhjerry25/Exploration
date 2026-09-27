@@ -67,7 +67,8 @@ def build(args, device="cpu"):
                        topk=getattr(args, "read_m", 64),
                        arch=getattr(args, "arch", None),
                        local_layers=getattr(args, "local_layers", None),
-                       ffn_ratio=getattr(args, "ffn_ratio", 4))
+                       ffn_ratio=getattr(args, "ffn_ratio", 4),
+                       grad_ckpt=bool(getattr(args, "grad_ckpt", 1)))
     return m.to(device)
 
 
@@ -374,6 +375,10 @@ def main():
     ap.add_argument("--eval_every", type=int, default=500)
     ap.add_argument("--ema", type=float, default=0.0, help="EMA eval decay, 0=off")
     ap.add_argument("--bf16", action="store_true", help="CUDA bf16 autocast")
+    ap.add_argument("--grad_ckpt", type=int, default=1,
+                    help="checkpoint each read chunk in training (bounds peak "
+                         "memory to one chunk's temporaries); 0 = full speed "
+                         "on >=80GB cards")
     ap.add_argument("--save", default="", help="checkpoint path (.pt)")
     ap.add_argument("--ckpt_every", type=int, default=0, help="periodic save interval")
     ap.add_argument("--resume", default="", help="resume from checkpoint path")
