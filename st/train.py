@@ -42,6 +42,7 @@ from . import lmdata
 from .stack_model import StackModel
 from .psr_model import PSRModel
 from .irt_model import IRTModel
+from .pkm_model import PKMModel
 
 VOCABS = {"passkey": data.VOCAB, "copying": data.VOCAB, "mqar": data.VOCAB,
           "mqar2": data.MQAR2_VOCAB, "lm": 256}
@@ -78,6 +79,14 @@ def build(args, device="cpu"):
                      layers=getattr(args, "layers", 6),
                      read_rounds=getattr(args, "read_rounds", 2),
                      ffn_ratio=getattr(args, "ffn_ratio", 4.0))
+    elif arch == "pkm":
+        m = PKMModel(vocab, dim=args.d, heads=args.heads,
+                     layers=getattr(args, "layers", 6),
+                     pkm_k=getattr(args, "pkm_k", 2401),
+                     pkm_m=getattr(args, "pkm_m", 2),
+                     pkm_heads=getattr(args, "pkm_heads", 4),
+                     balance=getattr(args, "pkm_balance", 0.0),
+                     ckpt=getattr(args, "pkm_ckpt", False))
     else:
         m = StackModel(vocab, dim=args.d, heads=args.heads, block_size=args.b,
                        topk=getattr(args, "read_m", 64),
@@ -128,6 +137,10 @@ def loss_and_acc(model, idx, tgt, mask):
     accuracy (diagnostic for passkey digits)."""
     logits = model(idx, sup=mask)
     loss = F.cross_entropy(logits[mask], tgt[mask])
+    if getattr(model, "training", False):
+        aux = getattr(model, "aux", None)
+        if aux is not None:
+            loss = loss + aux
     lp, tp = logits[mask], tgt[mask]
     hit = (lp.argmax(-1) == tp).view(idx.shape[0], -1)
     hit_vec = hit.all(1)
@@ -209,6 +222,19 @@ def overfit_test(device):
     print("[overfit] done (expect exact ~1.0)")
 
 
+def pkm_stats(model):
+    """Utilization and usage entropy of the last block's PKM table."""
+    idx = model.blocks[-1].table.last_idx
+    if idx is None:
+        return None, None
+    counts = torch.bincount(idx.reshape(-1).float().to(torch.int64),
+                            minlength=model.blocks[-1].table.rows).float()
+    util = (counts > 0).float().mean().item()
+    p = counts / counts.sum().clamp(min=1)
+    ent = -(p[p > 0] * p[p > 0].log()).sum().item()
+    return round(util, 4), round(ent, 3)
+
+
 def lr_at(step, total, base):
     warm = max(1, total // 20)
     if step < warm:
@@ -260,10 +286,14 @@ def train(args, device):
     torch.manual_seed(args.seed)
     model = build(args, device=device)
     if getattr(args, "compile", False):
-        try:
-            model = torch.compile(model)
-        except Exception as e:
-            print(f"[compile] torch.compile unavailable: {e}", flush=True)
+        if getattr(args, "arch", "stack") == "pkm":
+            print("[compile] skipped for pkm (topk/gather dynamic graph)",
+                  flush=True)
+        else:
+            try:
+                model = torch.compile(model)
+            except Exception as e:
+                print(f"[compile] torch.compile unavailable: {e}", flush=True)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"model={getattr(args, 'arch', 'stack')} n={args.n} "
           f"params={n_params/1e6:.2f}M device={device}", flush=True)
@@ -326,6 +356,10 @@ def train(args, device):
                        exact=round(em, 4), tok_s=tok_s, sec=round(now - t0, 1),
                        gnorm=round(float(gnorm), 3),
                        emb_n=round(_emb_norm(model), 3))
+            if getattr(args, "arch", "stack") == "pkm":
+                util, ent = pkm_stats(model)
+                if util is not None:
+                    rec["pkm_util"], rec["pkm_ent"] = util, ent
             print(json.dumps(rec), flush=True)
             log.write(json.dumps(rec) + "\n")
             log.flush()
@@ -389,7 +423,8 @@ def main():
     ap.add_argument("--eval_only", action="store_true",
                     help="load --resume checkpoint, eval once at args.n, exit")
     ap.add_argument("--selftest", action="store_true")
-    ap.add_argument("--arch", default="stack", choices=["stack", "psr", "irt"])
+    ap.add_argument("--arch", default="stack",
+                    choices=["stack", "psr", "irt", "pkm"])
     ap.add_argument("--layers", type=int, default=6, help="psr/irt block count")
     ap.add_argument("--read_rounds", type=int, default=2,
                     help="irt read rounds per block (1 = plain transformer)")
@@ -404,6 +439,16 @@ def main():
     ap.add_argument("--ffn_ratio", type=float, default=4.0)
     ap.add_argument("--compile", action="store_true",
                     help="torch.compile the model (best effort)")
+    ap.add_argument("--pkm_k", type=int, default=2401,
+                    help="pkm table rows (perfect square)")
+    ap.add_argument("--pkm_m", type=int, default=2,
+                    help="pkm top-m per sub-key set (m^2 cells read per head)")
+    ap.add_argument("--pkm_heads", type=int, default=4,
+                    help="pkm query heads per table")
+    ap.add_argument("--pkm_balance", type=float, default=0.0,
+                    help="pkm sub-key uniformity aux loss weight (0=off)")
+    ap.add_argument("--pkm_ckpt", action="store_true",
+                    help="gradient-checkpoint the pkm table (large m/batch)")
     args = ap.parse_args()
     if args.tag is None:
         args.tag = f"{args.arch}_{args.task}_n{args.n}_s{args.seed}"
