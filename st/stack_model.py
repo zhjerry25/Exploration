@@ -62,6 +62,7 @@ RoPE lives only in the local encoder; the score/read paths are NoPE so
 retrieval is distance-independent and length extrapolation is structural.
 """
 import math
+import time
 from numbers import Integral
 
 import torch
@@ -306,11 +307,23 @@ class StackModel(nn.Module):
         z = z + rd.read_out(ctx)
         return z + rd.ffn(rd.ffn_norm(z))
 
+    def _prof_tick(self, device):
+        """Phase timing hook (set self._prof to enable); syncs device first."""
+        if not getattr(self, "_prof", False):
+            return None
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        elif device.type == "mps":
+            torch.mps.synchronize()
+        return time.perf_counter()
+
     def forward(self, input_ids, sup=None):
         batch, n = input_ids.shape
         b = self.block_size
         groups = (n + b - 1) // b
+        t0 = self._prof_tick(input_ids.device)
         x, raw_k, raw_v = self.encode(input_ids)
+        t1 = self._prof_tick(input_ids.device)
         pos, s_n = self.supervised_positions(sup, n)
         if pos is None:
             pos = torch.arange(n, device=x.device)[None].expand(batch, n)
@@ -351,10 +364,16 @@ class StackModel(nn.Module):
                 else:
                     z = round_fn(rd, z, sl, env)
             outs.append(z)
+        t2 = self._prof_tick(input_ids.device)
         z = torch.cat(outs, dim=1)
         sup_logits = self.lm_head(self.final_norm(z))
         logits = sup_logits.new_zeros(batch, n, sup_logits.shape[-1])
         logits[z_rows, pos] = sup_logits
+        t3 = self._prof_tick(input_ids.device)
+        if t0 is not None:
+            self._prof_stats = {"enc_s": round(t1 - t0, 3),
+                                "read_s": round(t2 - t1, 3),
+                                "head_s": round(t3 - t2, 3)}
         return logits
 
     @torch.no_grad()

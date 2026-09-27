@@ -300,7 +300,10 @@ def train(args, device):
     g_train = torch.Generator().manual_seed(args.seed + 100)
     os.makedirs("runs", exist_ok=True)
     log = open(f"runs/{args.tag}.jsonl", "a")
+    if getattr(args, "prof", 0):
+        model._prof = True
     t0, last_t = time.time(), time.time()
+    eval_acc = 0.0  # eval seconds inside the current tok_s window (excluded)
     for step in range(start_step, args.steps):
         for pg in opt.param_groups:
             pg["lr"] = lr_at(step, args.steps, args.lr)
@@ -318,24 +321,31 @@ def train(args, device):
                     ema[k].mul_(args.ema).add_(v.detach(), alpha=1 - args.ema)
         if step % 100 == 0:
             now = time.time()
-            tok_s = int(args.bs * args.n * 100 / max(now - last_t, 1e-9)) if step > 0 else 0
-            last_t = now
+            train_dt = now - last_t - eval_acc
+            tok_s = int(args.bs * args.n * 100 / max(train_dt, 1e-9)) if step > 0 else 0
+            last_t, eval_acc = now, 0.0
             rec = dict(step=step, loss=round(loss.item(), 4), digit_acc=round(pd, 4),
                        exact=round(em, 4), tok_s=tok_s, sec=round(now - t0, 1),
                        gnorm=round(float(gnorm), 3),
                        emb_n=round(_emb_norm(model), 3))
+            if getattr(args, "prof", 0) and hasattr(model, "_prof_stats"):
+                rec.update(model._prof_stats)
             print(json.dumps(rec), flush=True)
             log.write(json.dumps(rec) + "\n")
             log.flush()
         if args.save and args.ckpt_every and (step + 1) % args.ckpt_every == 0:
             save_ckpt(args.save, model, opt, ema, args, step)
         if step % args.eval_every == 0 or step == args.steps - 1:
+            te = time.time()
             backup = None
             if ema is not None:
                 backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
                 model.load_state_dict(ema)
             model.eval()
             rec = dict(step=step, **evaluate(model, args, g_eval, device, 4))
+            eval_dt = time.time() - te
+            eval_acc += eval_dt
+            rec["eval_s"] = round(eval_dt, 1)
             print(json.dumps(rec), flush=True)
             log.write(json.dumps(rec) + "\n")
             log.flush()
@@ -379,6 +389,8 @@ def main():
                     help="checkpoint each read chunk in training (bounds peak "
                          "memory to one chunk's temporaries); 0 = full speed "
                          "on >=80GB cards")
+    ap.add_argument("--prof", type=int, default=0,
+                    help="log encode/read/head phase seconds every 100 steps")
     ap.add_argument("--save", default="", help="checkpoint path (.pt)")
     ap.add_argument("--ckpt_every", type=int, default=0, help="periodic save interval")
     ap.add_argument("--resume", default="", help="resume from checkpoint path")
