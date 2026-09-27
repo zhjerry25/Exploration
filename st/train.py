@@ -312,7 +312,11 @@ def train(args, device):
         with amp_ctx(args, device):
             loss, pd, em, _, _ = loss_and_acc(model, idx, tgt, mask)
         opt.zero_grad()
+        tb = time.time()
         loss.backward()
+        bwd_dt = time.time() - tb
+        if getattr(args, "prof", 0) and hasattr(model, "_prof_stats"):
+            model._prof_stats["bwd_s"] = round(bwd_dt, 3)
         gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         if ema is not None:

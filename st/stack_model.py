@@ -216,13 +216,14 @@ class StackModel(nn.Module):
     def _chunk_size(self, n):
         """Supervised positions per chunk; auto mode bounds the biggest
         temporary (push scores ~ H*n elems/pos, gathers ~ 2*H*m*b*hd
-        elems/pos) to ~2^28 elements (~0.5GB bf16)."""
+        elems/pos) to ~2^29 elements, so one checkpoint segment's recompute
+        peak stays modest even at bs16 (<=~11GB bf16)."""
         if self.pos_chunk > 0:
             return self.pos_chunk
         groups = (n + self.block_size - 1) // self.block_size
         m = min(self.topk, groups)
         elems_per_pos = self.heads * (n + 2 * m * self.block_size * self.hd)
-        return min(256, max(16, (1 << 28) // max(elems_per_pos, 1)))
+        return min(512, max(16, (1 << 29) // max(elems_per_pos, 1)))
 
     def _read_round_sparse(self, rd, z, sl, env):
         """One G round, exact top-m plumbing (general case). The local-window
@@ -358,7 +359,9 @@ class StackModel(nn.Module):
             for rd in self.reads:
                 if self.grad_ckpt and self.training and torch.is_grad_enabled():
                     # keep only z across chunks; recompute the big temporaries
-                    # (push scores, per-head gathers) during backward
+                    # (push scores, per-head gathers) during backward.
+                    # non-reentrant: the reentrant variant errors out on our
+                    # chained per-chunk checkpoints (backward-through-backward).
                     z = checkpoint(round_fn, rd, z, sl, env,
                                    use_reentrant=False)
                 else:
