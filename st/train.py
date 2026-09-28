@@ -1,5 +1,9 @@
 """Train/eval driver for the stack model and the dense baseline.
 
+Doctrine: TRAIN DENSE, INFER SPARSE. Training runs must be exactly dense
+(read_m >= n/b, enforced at startup) — the sparse top-m read path exists
+for inference only, where it activates zero-shot at long n.
+
 Usage:
   python -m st.train --selftest          # leak test (must be 0 diff) + overfit
   # synthetic: ignite small, transfer big
@@ -13,13 +17,14 @@ Usage:
   python -m st.train --task passkey --n 512 --steps 1500 --bs 64 --lr 5e-4 \
       --stop_exact 0.99 --save runs/stpk512.pt
   python -m st.train --task passkey --n 65536 --eval_only --resume runs/stpk512.pt --bs 4
-  # enwik8 LM (data/enwik8 bundled)
-  python -m st.train --task lm --n 4096 --steps 15000 --bs 16 --lr 5e-4 \
-      --save runs/lm.pt
+  # enwik8 LM, dense @512 (read_m=64 >= 512/16); sparse only in zero-shot eval
+  python -m st.train --task lm --n 512 --steps 30000 --bs 32 --lr 5e-4 \
+      --bf16 --save runs/lm512.pt
+  python -m st.train --task lm --n 65536 --eval_only --resume runs/lm512.pt --bs 2
   # dual-side scaling (arch spec: LxN independent / (X)xN weight-shared)
-  python -m st.train --task lm --n 4096 --arch "Lx2,(G)x4" --bf16 ...
+  python -m st.train --task lm --n 512 --arch "Lx2,(G)x4" --bf16 ...
   # dense transformer baseline, same params and layer passes as "Lx2,G"
-  python -m st.train --model baseline --layers 3 --task lm --n 4096 ...
+  python -m st.train --model baseline --layers 3 --task lm --n 512 ...
   # density-scaled hard MQAR: pairs grow with n, two-token keys
   python -m st.train --task mqar --n 512 --npairs_density 0.03125 --nkeytoks 2 ...
 """
@@ -42,7 +47,9 @@ VOCABS = {"passkey": data.VOCAB, "copying": data.VOCAB, "mqar": data.VOCAB,
           "lm": 256}
 
 
-def get_device():
+def get_device(requested=""):
+    if requested:
+        return torch.device(requested)
     if torch.cuda.is_available():
         return torch.device("cuda")
     if torch.backends.mps.is_available():
@@ -65,10 +72,8 @@ def build(args, device="cpu"):
     else:
         m = StackModel(vocab, dim=args.d, heads=args.heads, block_size=args.b,
                        topk=getattr(args, "read_m", 64),
-                       arch=getattr(args, "arch", None),
-                       local_layers=getattr(args, "local_layers", None),
-                       ffn_ratio=getattr(args, "ffn_ratio", 4),
-                       grad_ckpt=bool(getattr(args, "grad_ckpt", 1)))
+                       arch=getattr(args, "arch", None) or "Lx2,G",
+                       ffn_ratio=getattr(args, "ffn_ratio", 4))
     return m.to(device)
 
 
@@ -135,26 +140,6 @@ def posloss_diag(model, args, g_eval, device, bb, bins=16):
 def save_ckpt(path, model, opt, ema, args, step):
     torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
                 "ema": ema, "args": vars(args), "step": step}, path)
-
-
-_OLD_READ_PREFIXES = ("q_norm.", "wq.", "read_out.", "ffn_norm.", "ffn.")
-
-
-def remap_old_read_keys(sd):
-    """Pre-arch checkpoints stored the single read round at top level
-    (wq.*, read_out.*, q_norm.*, ffn_norm.*, ffn.*); they now live under
-    reads.0.*. New checkpoints are unaffected (their keys never start with
-    these prefixes)."""
-    if sd is None:
-        return None
-    out = {}
-    for k, v in sd.items():
-        for pre in _OLD_READ_PREFIXES:
-            if k.startswith(pre):
-                k = "reads.0." + k
-                break
-        out[k] = v
-    return out
 
 
 def leak_test():
@@ -256,6 +241,15 @@ def evaluate(model, args, g_eval, device, batches):
 def train(args, device):
     torch.manual_seed(args.seed)
     model = build(args, device=device)
+    if isinstance(model, StackModel) and not args.eval_only:
+        # dense-train doctrine gate: training must be exactly dense, so the
+        # sparse top-m machinery only ever runs at inference
+        groups = -(-args.n // args.b)
+        if args.read_m < groups:
+            raise SystemExit(
+                f"dense-train doctrine violated: read_m={args.read_m} < "
+                f"{groups} blocks at n={args.n}, b={args.b}. Raise --read_m "
+                f"or train shorter; sparsity belongs to inference only.")
     n_params = sum(p.numel() for p in model.parameters())
     if isinstance(model, StackModel):
         passes = len(model.local) + len(model.reads)
@@ -274,15 +268,15 @@ def train(args, device):
         # optimizer/EMA, restart step counter and schedule
         ck = torch.load(args.resume_weights_only, map_location=device,
                         weights_only=False)
-        missing, unexpected = model.load_state_dict(
-            remap_old_read_keys(ck["model"]), strict=False)
+        missing, unexpected = model.load_state_dict(ck["model"], strict=False)
         print(f"weights-only resume from {args.resume_weights_only}: "
-              f"{len(missing)} new / {len(unexpected)} skipped params", flush=True)
+              f"{len(missing)} new / {len(unexpected)} skipped params",
+              flush=True)
         for k in missing:
             print(f"  + new: {k}", flush=True)
     elif args.resume:
         ck = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(remap_old_read_keys(ck["model"]))
+        model.load_state_dict(ck["model"])
         opt.load_state_dict(ck["opt"])
         if ema is not None and ck.get("ema") is not None:
             ema = ck["ema"]
@@ -292,7 +286,7 @@ def train(args, device):
     if args.eval_only:
         assert args.resume, "--eval_only requires --resume"
         if ck.get("ema") is not None:
-            model.load_state_dict(remap_old_read_keys(ck["ema"]))
+            model.load_state_dict(ck["ema"])
         model.eval()
         rec = dict(n=args.n, **evaluate(model, args, g_eval, device, 8))
         print(json.dumps(rec), flush=True)
@@ -389,12 +383,10 @@ def main():
     ap.add_argument("--eval_every", type=int, default=500)
     ap.add_argument("--ema", type=float, default=0.0, help="EMA eval decay, 0=off")
     ap.add_argument("--bf16", action="store_true", help="CUDA bf16 autocast")
-    ap.add_argument("--grad_ckpt", type=int, default=1,
-                    help="checkpoint each read chunk in training (bounds peak "
-                         "memory to one chunk's temporaries); 0 = full speed "
-                         "on >=80GB cards")
     ap.add_argument("--prof", type=int, default=0,
                     help="log encode/read/head phase seconds every 100 steps")
+    ap.add_argument("--device", default="",
+                    help="force device (cuda/cpu/mps); default auto")
     ap.add_argument("--save", default="", help="checkpoint path (.pt)")
     ap.add_argument("--ckpt_every", type=int, default=0, help="periodic save interval")
     ap.add_argument("--resume", default="", help="resume from checkpoint path")
@@ -402,9 +394,8 @@ def main():
                     help="lenient weight resume (fresh opt/schedule, step 0)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--read_m", type=int, default=64,
-                    help="top-m blocks popped per head")
-    ap.add_argument("--local_layers", type=int, default=None,
-                    help="deprecated alias for --arch Lx{k},G")
+                    help="top-m blocks popped per head (inference; training "
+                         "requires read_m >= n/b: dense-train doctrine)")
     ap.add_argument("--nqueries", type=int, default=4, help="mqar queries per sequence")
     ap.add_argument("--npairs", type=int, default=16, help="mqar pairs per sequence")
     ap.add_argument("--npairs_density", type=float, default=0.0,
@@ -420,7 +411,7 @@ def main():
     args = ap.parse_args()
     if args.tag is None:
         args.tag = f"{args.model}_{args.task}_n{args.n}_s{args.seed}"
-    device = get_device()
+    device = get_device(args.device)
     if args.selftest:
         leak_test()
         overfit_test(device)

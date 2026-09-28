@@ -1,10 +1,11 @@
 """Stack model: attention push/pop with query-written block scores.
 
-Doctrine: text cannot be losslessly compressed, and a block that does not know
-the query standard will be misjudged (attention scatter). So the block
-"summary" is written FROM the query, on demand, and never stored: every
-supervised position's query directly probes every visible block's RAW keys,
-and the block's score is its exact attention partition function
+Doctrine: TRAIN DENSE, INFER SPARSE. Text cannot be losslessly compressed,
+and a block that does not know the query standard will be misjudged
+(attention scatter). So the block "summary" is written FROM the query, on
+demand, and never stored: every supervised position's query directly probes
+every visible block's RAW keys, and the block's score is its exact attention
+partition function
 
     s_j(t) = logsumexp_{i in block j} (q_t . k_i / sqrt(hd))
 
@@ -15,17 +16,30 @@ encode -> score -> select -> read, all parallel per position.
 
 The score path shares q and raw_k with the fine read, so selection is the
 EXACT block mass of the read semantics — a principled top-k approximation of
-full attention (at topk >= visible blocks it is exactly dense, which makes
-small-n ignition behave like a plain transformer). The gate is the harsh
-log_softmax over block scores (near-binary margins are G-invariant; relaxed
-gates destroy extrapolation).
+full attention. At topk >= visible blocks the candidate set is exactly the
+causal prefix [0, t] and the model is EXACTLY a dense causal attention with a
+per-block gate bias (test-guarded). That degenerate is not an approximation
+but the same function evaluated densely, which is what makes the doctrine
+valid here: training stays dense (the trainer refuses read_m < n/b), and the
+sparse top-m machinery runs only at inference, where RoPE-free scoring and
+fixed-shape ops make length extrapolation structural rather than learned.
+The gate is the harsh log_softmax over block scores (near-binary margins are
+G-invariant; relaxed gates destroy extrapolation).
+
+Dense read path (training + short contexts, topk >= blocks): one q.K^T
+matmul serves both the block partition functions and the fine read — one
+fused causal attention, no top-k, no gathers.
+
+Sparse read path (inference, topk < blocks): exact per-head top-m selection
+over block scores, gathers popped blocks + the local window, one softmax.
+Autograd-capable but only ever run under no_grad by the driver.
 
 Architecture spec (arch): a comma string of L (local halo encoder block) and
 G (global read round) items. `XxN` = N independently-weighted X layers;
 `(X)xN` = N passes of one weight-shared X layer (cycling adds compute passes,
 not parameters). All L must precede all G (encode -> read). Examples:
-"Lx2,G" (default, == the original 2-local + 1-read model), "Lx2,(G)x4"
-(read-side cycling), "Lx4,Gx2" (both sides deeper, independent weights).
+"Lx2,G" (default), "Lx2,(G)x4" (read-side cycling), "Lx4,Gx2" (both sides
+deeper, independent weights).
 
 All G rounds share one raw K/V (written ONCE after the last L and never
 rewritten) and one push/top-m/gate/pop machinery; only the query-side state z
@@ -39,27 +53,9 @@ Causality: position t (block k) reads the local window [(k-1)*b, t] directly
 and may select blocks j <= k-2 (fully covered, strictly in the past); block
 k-1 is covered by the local window and needs no selection.
 
-Dense fast path: when topk >= total blocks, every visible block is selected,
-the candidate set is exactly the causal prefix [0, t], and push+pop collapse
-into a single causal attention with a per-block gate bias (one score matmul
-serves both the block partition functions and the fine read). Numerically
-equivalent to the sparse path (guarded by tests), much cheaper at small n.
-
-Memory: the sparse read materialises ~H*(n + 2*m*b*hd) temporaries per
-supervised position (push scores + per-head block gathers), which autograd
-would retain across ALL chunks until the single backward — ~90GB at
-n=4096/bs16. During training each read round therefore runs under
-torch.utils.checkpoint (grad_ckpt=True, default): only the round input z is
-kept, chunk temporaries are recomputed during backward. Peak drops to one
-chunk's temporaries (~5GB at bs16) at the cost of one extra read-side
-forward. Disable (--grad_ckpt 0) on >=80GB cards for full speed. The read
-path is RNG-free, so recomputation is exact.
-
 sup: optional [B,N] bool loss mask — push/pop runs only at supervised
 positions (retrieval tasks: a handful per sequence); sup=None supervises all
 positions (leak tests, LM). Logits at unsupervised positions are zero.
-RoPE lives only in the local encoder; the score/read paths are NoPE so
-retrieval is distance-independent and length extrapolation is structural.
 """
 import math
 import time
@@ -68,7 +64,6 @@ from numbers import Integral
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.utils.checkpoint import checkpoint
 
 from .blocks import (HaloMemoryBlock, RotaryEmbedding, FeedForward,
                      KVProjection, _gather_heads)
@@ -130,8 +125,7 @@ class StackModel(nn.Module):
     """forward([B,N], sup=None) -> [B,N,vocab_size]."""
 
     def __init__(self, vocab_size, dim=256, heads=4, block_size=16, topk=64,
-                 arch=None, local_layers=None, ffn_ratio=4, pos_chunk=0,
-                 grad_ckpt=True):
+                 arch="Lx2,G", ffn_ratio=4, pos_chunk=0):
         super().__init__()
         integers = {"vocab_size": vocab_size, "dim": dim, "heads": heads,
                     "block_size": block_size, "topk": topk}
@@ -147,11 +141,8 @@ class StackModel(nn.Module):
             raise ValueError("dim / heads must be an even integer for RoPE")
         if not math.isfinite(ffn_ratio) or ffn_ratio <= 0:
             raise ValueError("ffn_ratio must be finite and positive")
-        if arch is None:
-            arch = f"Lx{local_layers if local_layers is not None else 2},G"
         self.dim, self.heads, self.hd = dim, heads, dim // heads
         self.block_size, self.topk, self.pos_chunk = block_size, topk, pos_chunk
-        self.grad_ckpt = bool(grad_ckpt)
         self.arch = arch
         self.embedding = nn.Embedding(vocab_size, dim)
         nn.init.normal_(self.embedding.weight, std=0.02)
@@ -216,8 +207,8 @@ class StackModel(nn.Module):
     def _chunk_size(self, n):
         """Supervised positions per chunk; auto mode bounds the biggest
         temporary (push scores ~ H*n elems/pos, gathers ~ 2*H*m*b*hd
-        elems/pos) to ~2^29 elements, so one checkpoint segment's recompute
-        peak stays modest even at bs16 (<=~11GB bf16)."""
+        elems/pos) to ~2^29 elements, so eval-time peaks stay modest even at
+        bs16 (<=~11GB bf16)."""
         if self.pos_chunk > 0:
             return self.pos_chunk
         groups = (n + self.block_size - 1) // self.block_size
@@ -357,15 +348,7 @@ class StackModel(nn.Module):
             sl = slice(start, min(s_n, start + chunk))
             z = x[z_rows, pos[:, sl]]
             for rd in self.reads:
-                if self.grad_ckpt and self.training and torch.is_grad_enabled():
-                    # keep only z across chunks; recompute the big temporaries
-                    # (push scores, per-head gathers) during backward.
-                    # non-reentrant: the reentrant variant errors out on our
-                    # chained per-chunk checkpoints (backward-through-backward).
-                    z = checkpoint(round_fn, rd, z, sl, env,
-                                   use_reentrant=False)
-                else:
-                    z = round_fn(rd, z, sl, env)
+                z = round_fn(rd, z, sl, env)
             outs.append(z)
         t2 = self._prof_tick(input_ids.device)
         z = torch.cat(outs, dim=1)

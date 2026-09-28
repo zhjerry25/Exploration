@@ -16,7 +16,7 @@ from st.blocks import _gather_heads
 
 def model(**overrides):
     args = dict(vocab_size=31, dim=16, heads=2, block_size=2, topk=3,
-                local_layers=2, pos_chunk=3)
+                arch="Lx2,G", pos_chunk=3)
     args.update(overrides)
     return StackModel(**args)
 
@@ -168,24 +168,6 @@ class StackModelTests(unittest.TestCase):
         for p in m.parameters():
             if p.grad is not None:
                 self.assertTrue(torch.isfinite(p.grad).all())
-
-    def test_grad_ckpt_matches_direct(self):
-        """Checkpointed read rounds must produce identical logits and grads."""
-        torch.manual_seed(7)
-        ref = model(grad_ckpt=False).double()
-        ck = model(grad_ckpt=True).double()
-        ck.load_state_dict(ref.state_dict())
-        ids = torch.randint(31, (2, 21))
-        sup = torch.zeros(2, 21, dtype=torch.bool)
-        sup[:, -4:] = True
-        ref.train(), ck.train()
-        out_r, out_c = ref(ids, sup=sup), ck(ids, sup=sup)
-        torch.testing.assert_close(out_c, out_r, rtol=1e-9, atol=1e-10)
-        probe = torch.randn(2, 21, 31, dtype=torch.double)
-        gr = torch.autograd.grad((out_r * probe).sum(), ref.parameters())
-        gc = torch.autograd.grad((out_c * probe).sum(), ck.parameters())
-        for a, e in zip(gc, gr):
-            torch.testing.assert_close(a, e, rtol=1e-8, atol=1e-9)
 
     def test_shared_weight_cycling(self):
         shared = model(arch="L,(G)x2")
@@ -366,8 +348,7 @@ class StackModelTests(unittest.TestCase):
 
     def test_configuration_and_empty_inputs(self):
         for kwargs in [dict(block_size=1), dict(heads=3), dict(topk=0),
-                       dict(local_layers=0), dict(ffn_ratio=0),
-                       dict(pos_chunk=-1)]:
+                       dict(ffn_ratio=0), dict(pos_chunk=-1)]:
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 model(**kwargs)
         m = model()
