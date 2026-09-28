@@ -55,7 +55,7 @@ say "E3 block size 扫描"
 for B in 8 16 32 64; do
   CK="runs/e3_b$B.pt"
   python -m st.train --model stack --task lm --n 512 --b $B --read_m 64 --arch Lx2,G --bs 32 --steps 8000 --lr 5e-4 --bf16 --save $CK
-  EXTRA="--b $B" zs $CK lm 4096 65536
+  EXTRA= zs $CK lm 4096 65536
 done
 
 # ── E4 加难 MQAR（键值随 n 增长，65k 时 2048 对；dense 点火 + 零样本，教义模范）
@@ -74,7 +74,7 @@ say "E5 训练长度扫描（b=32）"
 for N in 256 512 1024 2048; do
   CK="runs/e5_n$N.pt"
   python -m st.train --model stack --task lm --n $N --b 32 --read_m 64 --arch Lx2,G --bs 32 --steps 8000 --lr 5e-4 --bf16 --save $CK
-  EXTRA="--b 32" zs $CK lm 4096 16384 65536
+  EXTRA= zs $CK lm 4096 16384 65536
 done
 
 say "全部实验结束"

@@ -27,12 +27,16 @@ Usage:
   python -m st.train --model baseline --layers 3 --task lm --n 512 ...
   # density-scaled hard MQAR: pairs grow with n, two-token keys
   python -m st.train --task mqar --n 512 --npairs_density 0.03125 --nkeytoks 2 ...
+  # eval resume inherits the checkpoint's architecture (arch/b/d/heads);
+  # --n (eval length) and --read_m (top-m) are the eval-time knobs
+  python -m st.train --task lm --n 65536 --eval_only --resume runs/lm512.pt --bs 2
 """
 import argparse
 import contextlib
 import json
 import math
 import os
+import re
 import time
 
 import torch
@@ -71,7 +75,7 @@ def build(args, device="cpu"):
                           ffn_ratio=getattr(args, "ffn_ratio", 4))
     else:
         m = StackModel(vocab, dim=args.d, heads=args.heads, block_size=args.b,
-                       topk=getattr(args, "read_m", 64),
+                       topk=getattr(args, "read_m", None) or 64,
                        arch=getattr(args, "arch", None) or "Lx2,G",
                        ffn_ratio=getattr(args, "ffn_ratio", 4))
     return m.to(device)
@@ -240,6 +244,22 @@ def evaluate(model, args, g_eval, device, batches):
 
 def train(args, device):
     torch.manual_seed(args.seed)
+    ck = None
+    if args.resume_weights_only or args.resume:
+        # load early: the checkpoint is authoritative for model structure
+        # (arch/b/d/heads/layers/ffn_ratio), CLI structural flags only apply
+        # to fresh training. n stays a CLI knob (eval length), and read_m
+        # stays an inference knob (default: the checkpoint's value).
+        ck = torch.load(args.resume_weights_only or args.resume,
+                        map_location="cpu", weights_only=False)
+        trained = ck.get("args", {})
+        for k in ("model", "arch", "layers", "d", "heads", "b", "ffn_ratio"):
+            if trained.get(k) is not None:
+                setattr(args, k, trained[k])
+        if args.read_m is None:
+            args.read_m = trained.get("read_m")
+    if args.read_m is None:
+        args.read_m = 64
     model = build(args, device=device)
     if isinstance(model, StackModel) and not args.eval_only:
         # dense-train doctrine gate: training must be exactly dense, so the
@@ -266,8 +286,6 @@ def train(args, device):
     if args.resume_weights_only:
         # for switching to a longer sequence length: load weights, fresh
         # optimizer/EMA, restart step counter and schedule
-        ck = torch.load(args.resume_weights_only, map_location=device,
-                        weights_only=False)
         missing, unexpected = model.load_state_dict(ck["model"], strict=False)
         print(f"weights-only resume from {args.resume_weights_only}: "
               f"{len(missing)} new / {len(unexpected)} skipped params",
@@ -275,7 +293,6 @@ def train(args, device):
         for k in missing:
             print(f"  + new: {k}", flush=True)
     elif args.resume:
-        ck = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ck["model"])
         opt.load_state_dict(ck["opt"])
         if ema is not None and ck.get("ema") is not None:
@@ -393,9 +410,10 @@ def main():
     ap.add_argument("--resume_weights_only", default="",
                     help="lenient weight resume (fresh opt/schedule, step 0)")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--read_m", type=int, default=64,
-                    help="top-m blocks popped per head (inference; training "
-                         "requires read_m >= n/b: dense-train doctrine)")
+    ap.add_argument("--read_m", type=int, default=None,
+                    help="top-m blocks popped per head (inference; default 64 "
+                         "or the checkpoint's own value. Training requires "
+                         "read_m >= n/b: dense-train doctrine)")
     ap.add_argument("--nqueries", type=int, default=4, help="mqar queries per sequence")
     ap.add_argument("--npairs", type=int, default=16, help="mqar pairs per sequence")
     ap.add_argument("--npairs_density", type=float, default=0.0,
@@ -410,7 +428,15 @@ def main():
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
     if args.tag is None:
-        args.tag = f"{args.model}_{args.task}_n{args.n}_s{args.seed}"
+        # unique per configuration: concurrent runs never share a log file
+        parts = [args.model, args.task, f"n{args.n}"]
+        if args.model == "stack":
+            arch = args.arch or "Lx2,G"
+            parts += [re.sub(r"[^A-Za-z0-9]+", "", arch), f"b{args.b}"]
+        else:
+            parts += [f"L{args.layers}"]
+        parts.append(f"s{args.seed}")
+        args.tag = "_".join(parts)
     device = get_device(args.device)
     if args.selftest:
         leak_test()
