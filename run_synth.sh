@@ -8,7 +8,7 @@
 #
 # MQAR ignition from 128 → 512 training；passkey 512 training
 # 
-# Zero-shot extrapolation 4096 → 65536 → 1M → 2M → 4M → 8M → 16M
+# Zero-shot extrapolation 4096 → 65536 → 1M → 2M → 4M → 8M → 12M
 #
 # MQAR：npairs=16 + nqueries=16 (single token key)
 #
@@ -43,7 +43,7 @@ for S in 0 1 2; do
 
   say "S1 MQAR zero-shot extrapolation"
 
-  for N in 512 4096 65536 1000000 2000000 4000000 8000000 16000000; do
+  for N in 512 4096 65536 1000000 2000000 4000000 8000000 12000000; do
     python -m st.train --task mqar --n $N --npairs 16 --nqueries 16 \
       --eval_only --resume runs/s1_mqar512_s$S.pt --bs 1 --seed $S
   done
@@ -59,7 +59,7 @@ for S in 0 1 2; do
   
   say "S2 passkey zero-shot extrapolation"
 
-  for N in 512 4096 65536 1000000 2000000 4000000 8000000 16000000; do
+  for N in 512 4096 65536 1000000 2000000 4000000 8000000 12000000; do
     python -m st.train --task passkey --n $N \
       --eval_only --resume runs/s2_passkey512_s$S.pt --bs 1 --seed $S
   done
