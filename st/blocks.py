@@ -1,10 +1,12 @@
 """Shared building blocks for the stack model: local halo attention,
 RoPE, FFN and raw KV projection.
 
-The halo block runs causal attention over the previous block ++ the current
-block (2b window) with blocks folded into the batch/group axes; chunking
-bounds temporary score memory, not total training activations retained by
-autograd.
+Everything is streamed in query chunks: qkv projection, RoPE, the halo
+attention itself and the FFN all run on slices of a few blocks, so peak
+memory is independent of sequence length (long-context eval is bounded by
+the stored x / raw K/V, not by width-3d/4d temporaries). Chunk size never
+changes results (guarded by tests); folding bounds temporary score memory
+for CUDA backends with grid-size limits.
 """
 import torch
 from torch import nn
@@ -12,19 +14,6 @@ from torch.nn import functional as F
 
 
 FOLD_CHUNK = 8192
-
-
-def _pad_sequence(x, length):
-    """Right-pad axis 1, leaving all feature axes unchanged."""
-    if x.shape[1] == length:
-        return x
-    return torch.cat([x, x.new_zeros(x.shape[0], length - x.shape[1], *x.shape[2:])], dim=1)
-
-
-def _gather(source, indices):
-    """[B,N,H,Dh] and [B,G,K] -> [B,G,K,H,Dh]."""
-    rows = torch.arange(source.shape[0], device=source.device)[:, None, None]
-    return source[rows, indices]
 
 
 def _gather_heads(source, indices):
@@ -80,7 +69,8 @@ class FeedForward(nn.Sequential):
 
 
 class HaloMemoryBlock(nn.Module):
-    """Pre-norm causal attention over [prev block ++ current block] + FFN."""
+    """Pre-norm causal attention over [prev block ++ current block] + FFN,
+    fully streamed per query chunk (peak memory independent of n)."""
 
     def __init__(self, dim, heads, block_size, rope, ffn_ratio, query_chunk_size):
         super().__init__()
@@ -97,42 +87,65 @@ class HaloMemoryBlock(nn.Module):
         batch, n, dim = x.shape
         b = self.block_size
         groups = (n + b - 1) // b
-        q, k, v = self.qkv(self.attn_norm(x)).reshape(
-            batch, n, 3, self.heads, self.hd
-        ).unbind(2)
-        q, k = self.rope(q, positions), self.rope(k, positions)
-        q = _pad_sequence(q, groups * b).reshape(batch, groups, b, self.heads, self.hd)
-        offsets = torch.arange(b, device=x.device)
-        window = torch.arange(-b, b, device=x.device)
+        offs_q = torch.arange(b, device=x.device)
+        offs_k = torch.arange(2 * b, device=x.device)
+        # window entry u of query group g is token (g-1)*b+u; causal: u <= b+w
+        causal = offs_k[None, :] <= b + offs_q[:, None]          # [b,2b]
         outputs = []
         for start in range(0, groups, self.query_chunk_size):
             stop = min(groups, start + self.query_chunk_size)
-            base = torch.arange(start, stop, device=x.device) * b
-            qpos = base[:, None] + offsets
-            kpos = base[:, None] + window
-            valid = (kpos >= 0) & (kpos < n)
-            mask = valid[:, None, :] & (kpos[:, None, :] <= qpos[:, :, None])
-            idx = kpos.clamp(0, n - 1).unsqueeze(0).expand(batch, -1, -1)
-            outputs.append(_attention(q[:, start:stop], _gather(k, idx), _gather(v, idx),
-                                      mask.unsqueeze(0)))
+            gc = stop - start
+            lo = (start - 1) * b                    # previous block for K/V
+            seg = x[:, max(lo, 0):min(stop * b, n)]
+            left = b if start == 0 else 0           # virtual zero block
+            xs = F.pad(seg, (0, 0, left, (gc + 1) * b - left - seg.shape[1]))
+            pos_s = torch.arange(lo, lo + (gc + 1) * b, device=x.device)
+            q, k, v = self.qkv(self.attn_norm(xs)).reshape(
+                batch, (gc + 1) * b, 3, self.heads, self.hd).unbind(2)
+            q, k = self.rope(q, pos_s), self.rope(k, pos_s)
+            q = q.reshape(batch, gc + 1, b, self.heads, self.hd)[:, 1:]
+            k = k.reshape(batch, gc + 1, b, self.heads, self.hd)
+            v = v.reshape(batch, gc + 1, b, self.heads, self.hd)
+            k_w = torch.cat([k[:, :-1], k[:, 1:]], dim=2)  # [B,gc,2b,H,hd]
+            v_w = torch.cat([v[:, :-1], v[:, 1:]], dim=2)
+            key_pos = (torch.arange(start, stop, device=x.device)[:, None, None]
+                       * b - b + offs_k[None, None, :])    # [gc,1,2b] global
+            valid = (key_pos >= 0) & (key_pos < n)
+            mask = causal[None] & valid                    # [gc,b,2b]
+            outputs.append(_attention(q, k_w, v_w, mask))
         context = torch.cat(outputs, dim=1).reshape(batch, groups * b, dim)[:, :n]
         y = x + self.out(context)
-        return y + self.ffn(self.ffn_norm(y))
+        zs = []
+        step = self.query_chunk_size * b
+        for s0 in range(0, n, step):                # FFN is position-wise
+            yc = y[:, s0:s0 + step]
+            zs.append(yc + self.ffn(self.ffn_norm(yc)))
+        return torch.cat(zs, dim=1)
 
 
 class KVProjection(nn.Module):
-    def __init__(self, dim, heads, rope, use_rope=True):
+    """LayerNorm + linear -> (k, v), projected in token chunks so the
+    width-2d transient is bounded at long n (chunking never changes values)."""
+
+    def __init__(self, dim, heads, rope, use_rope=True, chunk_tokens=1 << 16):
         super().__init__()
         self.heads, self.hd = heads, dim // heads
         self.norm = nn.LayerNorm(dim)
         self.proj = nn.Linear(dim, 2 * dim, bias=False)
         self.rope = rope
         self.use_rope = use_rope
+        self.chunk_tokens = chunk_tokens
 
     def forward(self, x, positions):
-        k, v = self.proj(self.norm(x)).reshape(
-            x.shape[0], x.shape[1], 2, self.heads, self.hd
-        ).unbind(2)
-        if self.use_rope:
-            k = self.rope(k, positions)
-        return k, v
+        n = x.shape[1]
+        ks, vs = [], []
+        for s0 in range(0, n, self.chunk_tokens):
+            sl = slice(s0, s0 + self.chunk_tokens)
+            k, v = self.proj(self.norm(x[:, sl])).reshape(
+                x.shape[0], -1, 2, self.heads, self.hd
+            ).unbind(2)
+            if self.use_rope:
+                k = self.rope(k, positions[sl])
+            ks.append(k)
+            vs.append(v)
+        return torch.cat(ks, 1), torch.cat(vs, 1)
