@@ -48,3 +48,6 @@ python -m st.train --task passkey --n 2000000 --eval_only --resume runs/s2_passk
 python -m st.train --task passkey --n 4000000 --eval_only --resume runs/s2_passkey512.pt --bs 1
 
 say "S 组全部结束"
+
+# 全部实验结束后关机
+/usr/bin/shutdown
