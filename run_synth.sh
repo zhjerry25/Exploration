@@ -20,10 +20,10 @@ say() { echo; echo "===== [$(date '+%F %T')] $* ====="; }
 # ── S1 MQAR：128 点火 → 512 续训（保底，历史复现路径）
 say "S1 MQAR 128 点火"
 python -m st.train --task mqar --n 128 --npairs 16 --nqueries 16 \
-  --steps 3000 --bs 64 --lr 1e-3 --bf16 --stop_exact 0.99 --save runs/s1_mqar128.pt
+  --steps 3000 --bs 64 --lr 1e-3 --bf16 --save runs/s1_mqar128.pt
 say "S1 MQAR 512 续训（保底 checkpoint）"
 python -m st.train --task mqar --n 512 --npairs 16 --nqueries 16 \
-  --steps 2000 --bs 64 --lr 5e-4 --bf16 --stop_exact 0.99 \
+  --steps 6000 --bs 64 --lr 5e-4 --bf16 \
   --resume_weights_only runs/s1_mqar128.pt --save runs/s1_mqar512.pt
 
 say "S1 MQAR 零样本外推阶梯"
@@ -36,8 +36,8 @@ python -m st.train --task mqar --n 4000000 --npairs 16 --nqueries 16 --eval_only
 
 # ── S2 passkey：512 点火（保底）→ 同一外推阶梯
 say "S2 passkey 512 点火"
-python -m st.train --task passkey --n 512 --steps 1500 --bs 64 --lr 5e-4 \
-  --bf16 --stop_exact 0.99 --save runs/s2_passkey512.pt
+python -m st.train --task passkey --n 512 --steps 3000 --bs 64 --lr 5e-4 \
+  --bf16 --save runs/s2_passkey512.pt
 
 say "S2 passkey 零样本外推阶梯"
 python -m st.train --task passkey --n 512     --eval_only --resume runs/s2_passkey512.pt --bs 16
