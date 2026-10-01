@@ -21,6 +21,12 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 # fp32 evaluation; the unified planner selects GPU/CPU KV storage as needed.
 #
 # 3 seeds are used
+#
+# --no-checkpoint-chunks: the default-on chunked recompute costs ~170ms/step of
+#   pure Python overhead at these lengths (14 segments at n=512) and saves
+#   nothing a 2.4M model needs; loss is bitwise identical without it.
+# --no-optimizer-shard: ZeRO-1 adds per-step broadcast latency for a model
+#   whose optimizer state is 38MB; plain AdamW + DDP wins at this scale.
 # ─────────────────────────────────────────────────────────────────────────────
 
 mkdir -p runs
@@ -36,14 +42,16 @@ for S in 0 1 2; do
 
   python -m st train --task mqar --length 128 --npairs 16 --nqueries 16 \
   --steps 3000 --batch-size 64 --lr 1e-3 --precision bf16 --seed $S --save runs/s1_mqar128_s$S.pt \
-  --eval-every 500 --eval-batches 4 --log runs/s1_mqar128_s$S.jsonl
+  --eval-every 500 --eval-batches 4 --log runs/s1_mqar128_s$S.jsonl \
+  --no-checkpoint-chunks --no-optimizer-shard
 
   say "S1 MQAR 512 training"
 
   python -m st train --task mqar --length 512 --npairs 16 --nqueries 16 \
   --steps 6000 --batch-size 64 --lr 5e-4 --precision bf16 --seed $S \
   --weights-only --resume runs/s1_mqar128_s$S.pt --save runs/s1_mqar512_s$S.pt \
-  --eval-every 500 --eval-batches 4 --log runs/s1_mqar512_s$S.jsonl
+  --eval-every 500 --eval-batches 4 --log runs/s1_mqar512_s$S.jsonl \
+  --no-checkpoint-chunks --no-optimizer-shard
 
   say "S1 MQAR zero-shot extrapolation"
 
@@ -61,7 +69,8 @@ for S in 0 1 2; do
 
   python -m st train --task passkey --length 512 --steps 3000 --batch-size 64 --lr 5e-4 \
     --precision bf16 --seed $S --save runs/s2_passkey512_s$S.pt \
-    --eval-every 500 --eval-batches 4 --log runs/s2_passkey512_s$S.jsonl
+    --eval-every 500 --eval-batches 4 --log runs/s2_passkey512_s$S.jsonl \
+    --no-checkpoint-chunks --no-optimizer-shard
   
   say "S2 passkey zero-shot extrapolation"
 
