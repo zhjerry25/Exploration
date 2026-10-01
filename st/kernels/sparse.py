@@ -4,11 +4,12 @@ import triton as tr
 import triton.language as tl
 
 from .dense import _block_lse
+from .launch import launch
 
 
 @tr.jit
-def _scores(Q, K, POS, S, SQ: tl.constexpr, SK: tl.constexpr,
-            H: tl.constexpr, D: tl.constexpr, G: tl.constexpr, OFFSET: tl.constexpr,
+def _scores(Q, K, POS, S, OFFSET, SQ: tl.constexpr, SK: tl.constexpr,
+            H: tl.constexpr, D: tl.constexpr, G: tl.constexpr,
             B: tl.constexpr, DM: tl.constexpr, M: tl.constexpr, N: tl.constexpr,
             SCALE: tl.constexpr):
     qi = tl.program_id(0) * M + tl.arange(0, M)
@@ -36,9 +37,9 @@ def _scores(Q, K, POS, S, SQ: tl.constexpr, SK: tl.constexpr,
 
 
 @tr.jit
-def _pop(Q, K, V, POS, IDS, SCORES, ZR, O, LSE,
+def _pop(Q, K, V, POS, IDS, SCORES, ZR, O, LSE, OFFSET,
          SQ: tl.constexpr, SK: tl.constexpr, H: tl.constexpr, D: tl.constexpr,
-         KEEP: tl.constexpr, OFFSET: tl.constexpr, B: tl.constexpr,
+         KEEP: tl.constexpr, B: tl.constexpr,
          DM: tl.constexpr, T: tl.constexpr, SCALE: tl.constexpr):
     row = tl.program_id(0)
     head, query, batch = row % H, (row//H) % SQ, row//(H*SQ)
@@ -84,10 +85,11 @@ def block_scores(q, k, positions, block_size, offset=0):
     groups = tr.cdiv(k.shape[1], block_size)
     scores = torch.empty((batch, queries, heads, groups), device=q.device, dtype=torch.float32)
     m, n = 16, max(64, block_size)
-    _scores[(tr.cdiv(queries, m), tr.cdiv(k.shape[1], n), batch*heads)](
-        q, k, positions, scores, SQ=queries, SK=k.shape[1], H=heads, D=dim,
-        G=groups, OFFSET=offset, B=block_size, DM=max(16, tr.next_power_of_2(dim)),
-        M=m, N=n, SCALE=dim**-0.5, num_warps=4)
+    meta = dict(SQ=queries, SK=k.shape[1], H=heads, D=dim, G=groups,
+                B=block_size, DM=max(16, tr.next_power_of_2(dim)),
+                M=m, N=n, SCALE=dim**-0.5)
+    launch(_scores, lambda c: (tr.cdiv(queries, c["M"]), tr.cdiv(k.shape[1], c["N"]), batch*heads),
+           (q, k, positions, scores, offset), meta, q.device, q.dtype)
     return scores
 
 
@@ -98,7 +100,7 @@ def sparse_pop(q, k, v, positions, ids, scores, log_zr, block_size, offset=0):
     # Accumulate page/shard contributions in fp32, including for bf16 KV.
     out = torch.empty(q.shape, device=q.device, dtype=torch.float32)
     lse = torch.empty(q.shape[:3], device=q.device, dtype=torch.float32)
-    _pop[(batch*queries*heads,)](q, k, v, positions, ids, scores, log_zr, out, lse,
-        SQ=queries, SK=k.shape[1], H=heads, D=dim, KEEP=ids.shape[-1], OFFSET=offset,
+    _pop[(batch*queries*heads,)](q, k, v, positions, ids, scores, log_zr, out, lse, offset,
+        SQ=queries, SK=k.shape[1], H=heads, D=dim, KEEP=ids.shape[-1],
         B=block_size, DM=tr.next_power_of_2(dim), T=32, SCALE=dim**-0.5, num_warps=4)
     return out, lse

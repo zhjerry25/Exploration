@@ -20,7 +20,7 @@ full attention. At topk >= visible blocks the candidate set is exactly the
 causal prefix [0, t] and the model is EXACTLY a dense causal attention with a
 per-block gate bias (test-guarded). That degenerate is not an approximation
 but the same function evaluated densely, which is what makes the doctrine
-valid here: training stays dense (the trainer refuses read_m < n/b), and the
+valid here: training stays dense (forward_loss always uses the dense operator), and the
 sparse top-m machinery runs only at inference, where RoPE-free scoring and
 fixed-shape ops make length extrapolation structural rather than learned.
 The gate is the harsh log_softmax over block scores (near-binary margins are
@@ -365,37 +365,6 @@ class StackModel(nn.Module):
         z = z + rd.read_out(ctx)
         return z + rd.ffn(rd.ffn_norm(z))
 
-    def _read_round_dense(self, rd, z, sl, env):
-        """One G round when topk >= groups: the candidate set is exactly the
-        causal prefix [0, t], so push and pop collapse into a single causal
-        attention with a per-block gate bias. One q.K^T serves both the block
-        partition functions and the fine read."""
-        batch, cnt, _ = z.shape
-        n, b, groups, pad = env["n"], env["b"], env["groups"], env["pad"]
-        pos_c = env["pos"][:, sl]
-        q = rd.wq(rd.q_norm(z)).reshape(batch, cnt, self.heads, self.hd)
-        qh = q.permute(0, 2, 1, 3).reshape(batch * self.heads, cnt, self.hd)
-        kh = env["raw_k"].permute(0, 2, 3, 1).reshape(batch * self.heads,
-                                                      self.hd, n)
-        ts = torch.bmm(qh, kh).view(batch, self.heads, cnt, n) \
-            .permute(0, 2, 1, 3) / math.sqrt(self.hd)             # [B,c,H,n]
-        tsp = F.pad(ts, (0, pad)).view(batch, cnt, self.heads, groups, b)
-        s = tsp.logsumexp(-1)                                     # [B,c,H,G]
-        s = s.masked_fill(~env["visible"][:, sl, None, :], float('-inf'))
-        gate = torch.nan_to_num(s - s.logsumexp(-1, keepdim=True),
-                                nan=0.0, neginf=0.0)
-        bias = gate[:, :, :, env["block_ids"]]                    # [B,c,H,n]
-        causal = pos_c[:, :, None, None] >= env["token_ids"][None, None, None, :]
-        probs = (ts + bias).masked_fill(~causal, float('-inf')).softmax(-1)
-        vh = env["raw_v"].permute(0, 2, 1, 3)                     # [B,H,n,hd]
-        ctx = torch.bmm(probs.permute(0, 2, 1, 3).reshape(batch * self.heads,
-                                                         cnt, n),
-                        vh.reshape(batch * self.heads, n, self.hd))
-        ctx = ctx.view(batch, self.heads, cnt, self.hd) \
-            .permute(0, 2, 1, 3).reshape(batch, cnt, self.dim)
-        z = z + rd.read_out(ctx)
-        return z + rd.ffn(rd.ffn_norm(z))
-
     def _prof_tick(self, device):
         """Phase timing hook (set self._prof to enable); syncs device first."""
         if not getattr(self, "_prof", False):
@@ -422,18 +391,16 @@ class StackModel(nn.Module):
         if pos is None:
             pos = torch.arange(n, device=x.device)[None].expand(batch, n)
         offs = torch.arange(2 * b, device=x.device)
-        # block-view of the raw keys for the push pass (padded tail never
-        # satisfies visibility, so padding garbage is always masked)
-        pad = groups * b - n
-        kb = F.pad(raw_k, (0, 0, 0, 0, 0, pad)).reshape(batch, groups, b,
-                                                        self.heads, self.hd)
-        cover_end = (torch.arange(groups, device=x.device) + 1) * b
-        env = dict(n=n, b=b, groups=groups, pad=pad, kb=kb,
-                   raw_k=raw_k, raw_v=raw_v,
-                   rows3=torch.arange(batch, device=x.device)[:, None, None],
-                   block_ids=torch.arange(n, device=x.device) // b,
-                   token_ids=torch.arange(n, device=x.device))
         dense = self.topk >= groups
+        env = None
+        if not dense and torch.is_grad_enabled():
+            # Differentiable sparse reference is retained for mathematical
+            # checks. Production loss always dispatches forward_loss above.
+            pad = groups*b-n
+            kb = F.pad(raw_k, (0, 0, 0, 0, 0, pad)).reshape(batch, groups, b, self.heads, self.hd)
+            cover_end = (torch.arange(groups, device=x.device)+1)*b
+            env = dict(n=n, b=b, groups=groups, kb=kb, raw_k=raw_k, raw_v=raw_v,
+                       rows3=torch.arange(batch, device=x.device)[:, None, None])
         z_rows = torch.arange(batch, device=x.device)[:, None]
         outs = []
         chunk = self._chunk_size(n)
@@ -501,7 +468,6 @@ class StackModel(nn.Module):
         kb = F.pad(raw_k, (0, 0, 0, 0, 0, pad)).reshape(batch, groups, b,
                                                         self.heads, self.hd)
         cover_end = (torch.arange(groups, device=x.device) + 1) * b
-        visible = cover_end[None, None, :] <= ((block_of - 1) * b)[:, :, None]
         rd = self.reads[0]
         z_rows = torch.arange(batch, device=x.device)[:, None]
         keep = min(self.topk, groups)
@@ -510,7 +476,7 @@ class StackModel(nn.Module):
         for start in range(0, s_n, self._chunk_size(n)):
             stop = min(s_n, start + self._chunk_size(n))
             cnt = stop - start
-            vis = visible[:, start:stop]                        # [B,c,G]
+            vis = cover_end[None, None, :] <= ((block_of[:, start:stop]-1)*b)[:, :, None]
             z = x[z_rows, pos[:, start:stop]]
             q = rd.wq(rd.q_norm(z)).reshape(batch, cnt, self.heads, self.hd)
             s = self.push_scores(q, kb, vis)                    # [B,c,H,G]

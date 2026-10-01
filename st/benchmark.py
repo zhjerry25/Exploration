@@ -1,6 +1,6 @@
 """CUDA event timings and peak memory for exact dense/sparse operators.
 
-Use st.run train for end-to-end, multi-GPU optimizer-step throughput. This
+Use python -m st train for end-to-end, multi-GPU optimizer-step throughput. This
 microbenchmark measures the attention operator only, including dense backward.
 """
 import argparse
@@ -35,7 +35,7 @@ def dense_eager(q, k, v, positions, block_size):
     return (probs @ v.transpose(1, 2).float()).transpose(1, 2).to(q.dtype)
 
 
-def main():
+def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--operation", choices=["dense", "sparse"], default="dense")
     p.add_argument("--backend", choices=["triton", "torch", "eager"], default="triton")
@@ -51,7 +51,7 @@ def main():
     p.add_argument("--iterations", type=int, default=10)
     p.add_argument("--page-tokens", type=int, default=65536)
     p.add_argument("--output", default="")
-    args = p.parse_args()
+    args = p.parse_args(argv)
     if not torch.cuda.is_available():
         p.error("benchmark requires a remote NVIDIA GPU")
     if min(args.length, args.batch_size, args.heads, args.head_dim, args.block_size, args.iterations, args.topk) < 1 or args.warmup < 0:

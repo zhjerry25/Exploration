@@ -28,3 +28,14 @@ class TokenDataset:
         # uint16 advanced-indexing support.
         seq = torch.stack([self.tokens[int(i):int(i)+length+1].long() for i in offsets])
         return seq[:, :-1], seq[:, 1:], torch.ones(batch_size, length, dtype=torch.bool), None
+
+
+def enwik8_dataset(path="data/enwik8", split="train"):
+    """Original enwik8 split, via uint8 mmap; never downloads implicitly."""
+    ranges = {"train": (0, 90_000_000), "val": (90_000_000, 95_000_000),
+              "test": (95_000_000, 100_000_000)}
+    if split not in ranges:
+        raise ValueError("enwik8 split must be train/val/test")
+    if Path(path).stat().st_size != 100_000_000:
+        raise ValueError("enwik8 must be the extracted 100,000,000-byte file")
+    return TokenDataset(path, "uint8", *ranges[split])

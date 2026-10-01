@@ -83,8 +83,10 @@ def model_config(ck):
     if "config" in ck:
         return ck["config"]["model"]
     args = ck.get("args", {})
-    if args.get("model", "stack") != "stack":
-        raise ValueError("the scalable framework accepts StackModel checkpoints only")
+    if args.get("model", "stack") == "baseline":
+        return dict(model="baseline", vocab_size=256 if args.get("task") == "lm" else 128,
+                    dim=args.get("d", 256), heads=args.get("heads", 4),
+                    layers=args.get("layers", 3), ffn_ratio=args.get("ffn_ratio", 4))
     return dict(vocab_size=256 if args.get("task") == "lm" else 128,
                 dim=args.get("d", 256), heads=args.get("heads", 4),
                 block_size=args.get("b", 16), topk=args.get("read_m") or 64,

@@ -6,6 +6,7 @@ separate owners, avoiding fp32 atomics and an O(Q N) allocation. No dropout.
 import torch
 import triton as tr
 import triton.language as tl
+from .launch import launch
 
 
 @tr.jit
@@ -193,8 +194,9 @@ class _Dense(torch.autograd.Function):
         tile_n, tile_m = max(64, block_size), 16
         meta = dict(SQ=queries, SK=k.shape[1], H=heads, D=dim, B=block_size,
                     DM=max(16, tr.next_power_of_2(dim)), M=tile_m, N=tile_n,
-                    SCALE=dim ** -0.5, num_warps=4)
-        _forward[(tr.cdiv(queries, tile_m), batch * heads)](q, k, v, pos, out, rc, pr, zr, z, **meta)
+                    SCALE=dim ** -0.5)
+        launch(_forward, lambda c: (tr.cdiv(queries, c["M"]), batch*heads),
+               (q, k, v, pos, out, rc, pr, zr, z), meta, q.device, q.dtype)
         ctx.save_for_backward(q, k, v, pos, out, rc, pr, zr, z)
         ctx.meta = meta
         return out
@@ -209,10 +211,10 @@ class _Dense(torch.autograd.Function):
         batch, queries, heads, dim = q.shape
         _preprocess[(batch * queries * heads,)](out, rc, pr, grad, delta, rho,
             TOTAL=batch * queries * heads, D=dim, DM=tr.next_power_of_2(dim))
-        _backward_q[(tr.cdiv(queries, ctx.meta["M"]), batch * heads)](
-            q, k, v, pos, grad, zr, z, delta, rho, dq, **ctx.meta)
-        _backward_kv[(tr.cdiv(k.shape[1], ctx.meta["N"]), batch * heads)](
-            q, k, v, pos, grad, zr, z, delta, rho, dk, dv, **ctx.meta)
+        launch(_backward_q, lambda c: (tr.cdiv(queries, c["M"]), batch*heads),
+               (q, k, v, pos, grad, zr, z, delta, rho, dq), ctx.meta, q.device, q.dtype)
+        launch(_backward_kv, lambda c: (tr.cdiv(k.shape[1], c["N"]), batch*heads),
+               (q, k, v, pos, grad, zr, z, delta, rho, dk, dv), ctx.meta, q.device, q.dtype)
         return dq, dk, dv, None, None
 
 

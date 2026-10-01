@@ -97,8 +97,8 @@ def training_estimate(model, batch, length, cp_size=1, checkpoint_chunks=True):
     # fp32 weights/grad/m/v. Conservative activation estimate, includes
     # multiple global-read passes, local residuals and all-to-all buffers.
     param_bytes = params*16
-    layers = len(model.local)
-    reads = len(model.reads)
+    layers = len(model.local) if hasattr(model, "local") else len(model.blocks)
+    reads = len(model.reads) if hasattr(model, "reads") else layers
     factor = (layers*2+reads*8+12) if checkpoint_chunks else (layers*16+reads*20+12)
     activations = batch*local*model.dim*4*factor
     return {"parameters": params, "parameter_optimizer_bytes": param_bytes,

@@ -19,6 +19,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from .attention import dense_attention
+from .baseline import BaselineModel
 from .inference import InferenceSession
 from .parallel import ParallelContext, sum_all
 from .sparse import TensorPages, sparse_attention
@@ -42,7 +43,10 @@ def environment():
 
 def reference_suite():
     torch.set_num_threads(2)
-    suite = unittest.defaultTestLoader.discover("tests")
+    root = Path(__file__).resolve().parents[1]
+    if not (root/"tests").is_dir():
+        raise RuntimeError("reference validation requires the source checkout, including tests/")
+    suite = unittest.defaultTestLoader.discover(str(root/"tests"), top_level_dir=str(root))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     if not result.wasSuccessful():
         raise AssertionError(f"reference tests: {len(result.failures)} failures, {len(result.errors)} errors")
@@ -50,6 +54,7 @@ def reference_suite():
 
 
 def error_metrics(actual, expected):
+    actual, expected = actual.detach(), expected.detach()
     difference = (actual.float()-expected.float()).abs()
     return {"max_abs": float(difference.max()),
             "relative_rms": float(difference.square().mean().sqrt()/expected.float().square().mean().sqrt().clamp_min(1.e-8))}
@@ -71,6 +76,8 @@ def cuda_suite():
         if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
             raise RuntimeError("bf16 support is required for the target validation matrix")
         for n, b, d in cases:
+            print(json.dumps({"event": "case_start", "dtype": str(dtype), "n": n,
+                              "block": b, "head_dim": d}), flush=True)
             q = torch.randn(2, 5, 2, d, device="cuda", dtype=dtype, requires_grad=True)
             k = torch.randn(2, n, 2, d, device="cuda", dtype=dtype, requires_grad=True)
             v = torch.randn_like(k, requires_grad=True)
@@ -121,7 +128,8 @@ def cuda_suite():
             torch.testing.assert_close(a.grad, e.grad, atol=.08, rtol=.06, msg=name)
             gradient_error[name] = error_metrics(a.grad, e.grad)
     results.append({"operation": "end_to_end_bf16", "loss": error_metrics(actual, expected), "gradients": gradient_error})
-    return {"cases": results}
+    from .kernels.launch import launch_report
+    return {"cases": results, "kernel_launches": launch_report()}
 
 
 def distributed_suite(cp_size):
@@ -132,47 +140,51 @@ def distributed_suite(cp_size):
     from tests.test_attention import eager_attention
     records = []
     try:
-        for kind in ("full", "tail", "ragged"):
-            torch.manual_seed(928)
-            base = StackModel(31, 32, 8, 4, 64, "(L)x2,(G)x2", backend="torch",
-                              checkpoint_chunks=True, encoder_chunk=8, pos_chunk=3).to(device).double()
-            ref = copy.deepcopy(base)
-            wrapped = DDP(base, device_ids=[device.index], broadcast_buffers=False)
-            n, batch = 37, 2
-            batches = []
-            for replica in range(parallel.dp_size):
-                g = torch.Generator().manual_seed(127+replica)
-                ids = torch.randint(31, (batch, n), generator=g)
-                target = torch.randint(31, (batch, n), generator=g)
-                mask = torch.ones_like(ids, dtype=torch.bool)
-                if kind == "tail":
-                    mask[:, :-3] = False  # all but last CP rank have zero queries
-                elif kind == "ragged":
-                    mask = torch.rand(batch, n, generator=g) > .65
-                    mask[0] = False
-                batches.append((ids, target, mask))
-            total_count = sum(int(b[2].sum()) for b in batches)
-            reference_loss = torch.zeros((), device=device)
-            for ids, target, mask in batches:
-                ref_out = ref(ids.to(device), targets=target.to(device), sup=mask.to(device))
-                reference_loss = reference_loss + ref_out["loss_sum"]/total_count
-            reference_loss.backward()
-            ids, target, mask = batches[parallel.dp_rank]
-            ids, offset = parallel.shard(ids, 4)
-            target, _ = parallel.shard(target, 4, -100)
-            mask, _ = parallel.shard(mask, 4, False)
-            result = wrapped(ids.to(device), targets=target.to(device), sup=mask.to(device), parallel=parallel, offset=offset)
-            global_count = sum_all(result["count"])
-            self_loss = result["loss_sum"]*parallel.world_size/global_count
-            self_loss.backward()
-            torch.testing.assert_close(sum_all(result["loss_sum"])/global_count, reference_loss.detach(), rtol=2.e-6, atol=2.e-6)
-            metrics = {}
-            for (name, p), (_, rp) in zip(base.named_parameters(), ref.named_parameters()):
-                if rp.grad is not None:
-                    torch.testing.assert_close(p.grad, rp.grad, rtol=5.e-5, atol=5.e-7, msg=name)
-                    metrics[name] = error_metrics(p.grad, rp.grad)
-            records.append({"operation": "distributed_gradient", "mask": kind, "cp": cp_size,
-                            "dp": parallel.dp_size, "gradients": metrics})
+        for model_kind in ("stack", "baseline"):
+            for kind in ("full", "tail", "ragged"):
+                torch.manual_seed(928)
+                base = (StackModel(31, 32, 8, 4, 64, "(L)x2,(G)x2", backend="torch",
+                                   checkpoint_chunks=True, encoder_chunk=8, pos_chunk=3)
+                        if model_kind == "stack" else
+                        BaselineModel(31, 32, 8, layers=2, checkpoint_chunks=True, loss_chunk=3))
+                base = base.to(device).double()
+                ref = copy.deepcopy(base)
+                wrapped = DDP(base, device_ids=[device.index], broadcast_buffers=False)
+                n, batch = 37, 2
+                batches = []
+                for replica in range(parallel.dp_size):
+                    g = torch.Generator().manual_seed(127+replica)
+                    ids = torch.randint(31, (batch, n), generator=g)
+                    target = torch.randint(31, (batch, n), generator=g)
+                    mask = torch.ones_like(ids, dtype=torch.bool)
+                    if kind == "tail":
+                        mask[:, :-3] = False  # all but last CP rank have zero queries
+                    elif kind == "ragged":
+                        mask = torch.rand(batch, n, generator=g) > .65
+                        mask[0] = False
+                    batches.append((ids, target, mask))
+                total_count = sum(int(b[2].sum()) for b in batches)
+                reference_loss = torch.zeros((), device=device)
+                for ids, target, mask in batches:
+                    ref_out = ref(ids.to(device), targets=target.to(device), sup=mask.to(device))
+                    reference_loss = reference_loss + ref_out["loss_sum"]/total_count
+                reference_loss.backward()
+                ids, target, mask = batches[parallel.dp_rank]
+                ids, offset = parallel.shard(ids, base.block_size)
+                target, _ = parallel.shard(target, base.block_size, -100)
+                mask, _ = parallel.shard(mask, base.block_size, False)
+                result = wrapped(ids.to(device), targets=target.to(device), sup=mask.to(device), parallel=parallel, offset=offset)
+                global_count = sum_all(result["count"])
+                self_loss = result["loss_sum"]*parallel.world_size/global_count
+                self_loss.backward()
+                torch.testing.assert_close(sum_all(result["loss_sum"])/global_count, reference_loss.detach(), rtol=2.e-6, atol=2.e-6)
+                metrics = {}
+                for (name, p), (_, rp) in zip(base.named_parameters(), ref.named_parameters()):
+                    if rp.grad is not None:
+                        torch.testing.assert_close(p.grad, rp.grad, rtol=5.e-5, atol=5.e-7, msg=name)
+                        metrics[name] = error_metrics(p.grad, rp.grad)
+                records.append({"operation": "distributed_gradient", "model": model_kind, "mask": kind, "cp": cp_size,
+                                "dp": parallel.dp_size, "gradients": metrics})
         # Cross-rank global sparse top-k and causal halo warmup, including
         # weight-shared local/global passes and a non-divisible tail.
         torch.manual_seed(99)
@@ -194,12 +206,12 @@ def distributed_suite(cp_size):
         dist.destroy_process_group()
 
 
-def main():
+def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--suite", choices=["reference", "cuda", "distributed"], required=True)
     p.add_argument("--cp", type=int, default=2)
     p.add_argument("--output", default="validation.json")
-    args = p.parse_args()
+    args = p.parse_args(argv)
     report = {"environment": environment(), "suite": args.suite, "passed": False}
     start = time.perf_counter()
     error = None
@@ -210,6 +222,9 @@ def main():
     except BaseException:
         error = traceback.format_exc()
         report["error"] = error
+        if "st.kernels.launch" in sys.modules:
+            from .kernels.launch import launch_report
+            report["kernel_launches"] = launch_report()
     report["seconds"] = time.perf_counter()-start
     rank = int(os.environ.get("RANK", "0"))
     path = Path(args.output)
