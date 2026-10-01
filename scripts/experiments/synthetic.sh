@@ -32,7 +32,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 mkdir -p runs
 say() { echo; echo "===== [$(date '+%F %T')] $* ====="; }
 
-for S in 0 1 2; do
+for S in 0 2 4; do
 
   # ── S1 MQAR ──
 
@@ -55,7 +55,7 @@ for S in 0 1 2; do
 
   say "S1 MQAR zero-shot extrapolation"
 
-  for N in 512 4096 65536 1000000 2000000 4000000 8000000 12000000; do
+  for N in 512 4096 65536 1000000 2000000 4000000 8000000 16000000; do
     python -m st eval --task mqar --length $N --npairs 16 --nqueries 16 \
       --resume runs/s1_mqar512_s$S.pt --batch-size 1 --seed $S --precision fp32 \
       --eval-batches 8 --log runs/s1_mqar512_s$S.eval.jsonl
@@ -74,7 +74,7 @@ for S in 0 1 2; do
   
   say "S2 passkey zero-shot extrapolation"
 
-  for N in 512 4096 65536 1000000 2000000 4000000 8000000 12000000; do
+  for N in 512 4096 65536 1000000 2000000 4000000 8000000 16000000; do
     python -m st eval --task passkey --length $N \
       --resume runs/s2_passkey512_s$S.pt --batch-size 1 --seed $S --precision fp32 \
       --eval-batches 8 --log runs/s2_passkey512_s$S.eval.jsonl
