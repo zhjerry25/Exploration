@@ -30,6 +30,17 @@ def _tile(q, k, pos, offset, block_size):
     return a, sb, remote, local
 
 
+def _kv_tile(k, v, start, end, block_size, dtype, device):
+    pad = (-(end - start)) % block_size
+    kc = k[:, start:end].transpose(1, 2).to(dtype)
+    vc = v[:, start:end].transpose(1, 2).to(dtype)
+    if pad:
+        kc = torch.nn.functional.pad(kc, (0, 0, 0, pad))
+        vc = torch.nn.functional.pad(vc, (0, 0, 0, pad))
+    valid = torch.arange(start, start + kc.shape[-2], device=device) < k.shape[1]
+    return kc, vc, valid
+
+
 def _merge(logits, v, m, den, num):
     new_m = torch.maximum(m, logits.amax(-1))
     safe = torch.where(torch.isfinite(new_m), new_m, torch.zeros_like(new_m))
@@ -47,6 +58,8 @@ def _forward_torch(q, k, v, positions, block_size, q_chunk, kv_chunk):
     lzr, lse = torch.empty_like(pr), torch.empty_like(pr)
     nk = k.shape[1]
     kv_chunk = max(block_size, kv_chunk // block_size * block_size)
+    # One tile covering K: cast/pad it once instead of per query chunk.
+    held = _kv_tile(k, v, 0, nk, block_size, dtype, q.device) if nk <= kv_chunk else None
     for lo in range(0, queries, q_chunk):
         hi = min(lo + q_chunk, queries)
         qc = q[:, lo:hi].transpose(1, 2).to(dtype)
@@ -58,16 +71,10 @@ def _forward_torch(q, k, v, positions, block_size, q_chunk, kv_chunk):
         nl, nr = torch.zeros_like(qc), torch.zeros_like(qc)
         for start in range(0, nk, kv_chunk):
             end = min(start + kv_chunk, nk)
-            pad = (- (end - start)) % block_size
-            kc = k[:, start:end].transpose(1, 2).to(dtype)
-            vc = v[:, start:end].transpose(1, 2).to(dtype)
-            if pad:
-                kc = torch.nn.functional.pad(kc, (0, 0, 0, pad))
-                vc = torch.nn.functional.pad(vc, (0, 0, 0, pad))
+            kc, vc, valid = held if held is not None else _kv_tile(k, v, start, end, block_size, dtype, q.device)
             a, sb, remote, local = _tile(qc, kc, pos, start, block_size)
             # Invalid padded keys cannot be remote (positions are < nk).
-            local = local & (torch.arange(start, start + kc.shape[-2],
-                                          device=q.device) < nk)
+            local = local & valid
             zr = torch.logaddexp(zr, a.masked_fill(~remote, -torch.inf).logsumexp(-1))
             mr, dr, nr = _merge((a + sb).masked_fill(~remote, -torch.inf), vc, mr, dr, nr)
             ml, dl, nl = _merge(a.masked_fill(~local, -torch.inf), vc, ml, dl, nl)
@@ -102,6 +109,7 @@ class _TorchDense(torch.autograd.Function):
         dq, dk, dv = (torch.zeros(t.shape, device=t.device, dtype=dtype) for t in (q, k, v))
         b, nk = ctx.block_size, k.shape[1]
         kc_size = max(b, ctx.kv_chunk // b * b)
+        held = _kv_tile(k, v, 0, nk, b, dtype, q.device) if nk <= kc_size else None
         for lo in range(0, q.shape[1], ctx.q_chunk):
             hi = min(lo + ctx.q_chunk, q.shape[1])
             qc = q[:, lo:hi].transpose(1, 2).to(dtype)
@@ -115,14 +123,9 @@ class _TorchDense(torch.autograd.Function):
             z = torch.where(torch.isfinite(z), z, 0.)
             for start in range(0, nk, kc_size):
                 end = min(start + kc_size, nk)
-                pad = (-(end - start)) % b
-                kc = k[:, start:end].transpose(1, 2).to(dtype)
-                vc = v[:, start:end].transpose(1, 2).to(dtype)
-                if pad:
-                    kc = torch.nn.functional.pad(kc, (0, 0, 0, pad))
-                    vc = torch.nn.functional.pad(vc, (0, 0, 0, pad))
+                kc, vc, valid = held if held is not None else _kv_tile(k, v, start, end, b, dtype, q.device)
                 a, sb, remote, local = _tile(qc, kc, positions[:, lo:hi], start, b)
-                local = local & (torch.arange(start, start + kc.shape[-2], device=q.device) < nk)
+                local = local & valid
                 probs = torch.exp(torch.where(remote, a + sb - zr[..., None], a) - z[..., None])
                 probs = torch.where(remote | local, probs, 0.)
                 direct = probs * (gc @ vc.transpose(-1, -2) - delta[..., None])

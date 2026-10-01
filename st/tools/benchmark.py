@@ -17,6 +17,12 @@ from ..runtime.memory import GiB
 from ..ops.sparse import TensorPages, sparse_attention
 from .validate import environment
 
+BACKEND_ROLES = {
+    "eager": "Q x N algebra reference (autograd; materializes the full score matrix)",
+    "torch": "bounded-memory fp32 reference/oracle (chunked tiles); not a performance baseline",
+    "triton": "fused kernel",
+}
+
 
 def dense_eager(q, k, v, positions, block_size):
     """Vectorized original dense algebra; intentionally materializes Q x N."""
@@ -41,6 +47,8 @@ def parser():
     p = argparse.ArgumentParser(prog="python -m st benchmark", description=__doc__, allow_abbrev=False)
     p.epilog = ("Examples: python -m st benchmark --compare --length 512 | "
                 "python -m st benchmark --operation sparse --length 1048576 --queries 16. "
+                "dense measures forward+backward on all positions; sparse measures decode-style "
+                "exact scoring over the full resident KV cache plus the top-k read, forward only. "
                 "For full-model training throughput, use python -m st train --task random.")
     p.add_argument("--compare", action="store_true", help="same inputs: compare eager/torch/triton (sparse: torch/triton)")
     p.add_argument("--operation", choices=["dense", "sparse"], default="dense")
@@ -52,6 +60,8 @@ def parser():
     p.add_argument("--head-dim", type=int, default=64)
     p.add_argument("--block-size", type=int, default=16)
     p.add_argument("--topk", type=int, default=64)
+    p.add_argument("--q-chunk", type=int, default=0, help="dense torch-reference query tile; 0 = library default")
+    p.add_argument("--kv-chunk", type=int, default=0, help="dense torch-reference KV tile; 0 = library default")
     p.add_argument("--precision", choices=["fp32", "bf16"], default="bf16")
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--iterations", type=int, default=10)
@@ -64,8 +74,8 @@ def measure(args):
     p = parser()
     if not torch.cuda.is_available():
         p.error("benchmark requires a remote NVIDIA GPU")
-    if min(args.length, args.batch_size, args.heads, args.head_dim, args.block_size, args.iterations, args.topk) < 1 or args.warmup < 1 or args.queries < 0 or args.page_tokens < args.block_size:
-        p.error("dimensions/iterations/warmup must be positive, queries >= 0, page_tokens >= block_size")
+    if min(args.length, args.batch_size, args.heads, args.head_dim, args.block_size, args.iterations, args.topk) < 1 or args.warmup < 1 or min(args.queries, args.q_chunk, args.kv_chunk) < 0 or args.page_tokens < args.block_size:
+        p.error("dimensions/iterations/warmup must be positive, queries/chunks >= 0, page_tokens >= block_size")
     queries = args.queries or (args.length if args.operation == "dense" else min(16, args.length))
     if queries > args.length:
         p.error("queries must not exceed length")
@@ -88,11 +98,13 @@ def measure(args):
     probe = torch.randn_like(q)
     cache = TensorPages(k, v, max(args.block_size, args.page_tokens//args.block_size*args.block_size))
 
+    chunks = {name: size for name, size in (("q_chunk", args.q_chunk), ("kv_chunk", args.kv_chunk)) if size}
+
     def iteration():
         if args.operation == "dense":
             q.grad = k.grad = v.grad = None
             fn = (lambda: dense_eager(q, k, v, positions, args.block_size)) if args.backend == "eager" else (
-                lambda: dense_attention(q, k, v, positions, args.block_size, args.backend))
+                lambda: dense_attention(q, k, v, positions, args.block_size, args.backend, **chunks))
             out = fn()
             out.backward(probe)
         else:
@@ -113,6 +125,7 @@ def measure(args):
         times.append(begin.elapsed_time(end))
     ordered = sorted(times)
     report = {"environment": environment(), "config": vars(args), "queries": queries,
+              "role": BACKEND_ROLES[args.backend], "includes_backward": args.operation == "dense",
               "latency_ms_median": ordered[len(ordered)//2], "latency_ms_min": min(times),
               "latency_ms_samples": times,
               "peak_allocated_gib": torch.cuda.max_memory_allocated()/GiB,
@@ -142,6 +155,14 @@ def main(argv=None):
         print(f"{backend}: median={report['latency_ms_median']:.3f} ms, "
               f"peak allocated={report['peak_allocated_gib']:.3f} GiB, "
               f"reserved={report['peak_reserved_gib']:.3f} GiB", flush=True)
+    if args.compare:
+        note = ("dense timings include backward; 'torch' is the bounded-memory fp32 reference "
+                "(chunked tiles, scores recomputed in backward). Its gap to eager at short "
+                "lengths is per-kernel launch overhead, not a triton speedup ratio."
+                if args.operation == "dense" else
+                "'torch' is the paged fp32 reference; scoring is exact over the full resident "
+                "KV cache, which dominates both latency and peak memory.")
+        print(f"Note: {note}", flush=True)
     report = {"comparison": reports} if args.compare else reports[0]
     label = "compare" if args.compare else args.backend
     path = Path(args.output or f"runs/benchmarks/{args.operation}-{label}.json")

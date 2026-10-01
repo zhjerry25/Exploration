@@ -12,7 +12,7 @@
     "precision": "bf16",
     "backend": "auto",
     "context_parallel": "auto",
-    "checkpoint_chunks": true,
+    "checkpoint_chunks": false,
     "optimizer_shard": true,
     "encoder_chunk": 1024,
     "query_chunk": 128,

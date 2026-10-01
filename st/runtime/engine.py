@@ -59,9 +59,6 @@ def choose_cp(args, model, world, capacity):
             raise ValueError("context_parallel must divide both WORLD_SIZE and heads")
         return cp
     candidates = [c for c in range(1, world+1) if world % c == 0 and model.heads % c == 0]
-    # Full-token losses at long n benefit from parallelizing the dense read.
-    if args.length >= 8192 and args.task in ("tokens", "enwik8", "random", "copying"):
-        return candidates[-1]
     for cp in candidates:
         estimate = training_estimate(model, args.batch_size, args.length, cp, args.checkpoint_chunks)
         if estimate["estimated_total_bytes"] < capacity*args.memory_fraction:
@@ -101,7 +98,8 @@ def train(args, model, parallel, ck, dataset, validation_dataset=None):
         if "rng_by_rank" in ck:
             ckpt.restore_rng(ck["rng_by_rank"][parallel.rank], generator)
         else:
-            emit({"warning": "legacy checkpoint has no RNG state; data stream restarts"}, args, parallel.rank)
+            emit({"event": "warning",
+                  "message": "legacy checkpoint has no RNG state; data stream restarts"}, args, parallel.rank)
     if ck is not None:
         ck.clear()  # do not retain a full CPU optimizer copy on every rank
     model_keys = set(ModelConfig.__dataclass_fields__)
@@ -153,29 +151,29 @@ def train(args, model, parallel, ck, dataset, validation_dataset=None):
             timing = torch.tensor(elapsed, device=device)
             if parallel.world_size > 1:
                 dist.all_reduce(timing, op=dist.ReduceOp.MAX)
-            emit({"event": "train", "step": step+1, "loss": float(totals[0]/totals[1]),
-                  "accuracy": float(totals[2]/totals[1]), "grad_norm": float(norm),
-                  "tokens_per_second": window_steps*args.grad_accum*args.batch_size*parallel.dp_size*args.length/float(timing),
-                  "peak_allocated_gib": torch.cuda.max_memory_allocated(device)/GiB if device.type == "cuda" else None,
-                  "peak_reserved_gib": torch.cuda.max_memory_reserved(device)/GiB if device.type == "cuda" else None}, args, parallel.rank)
+            emit({"event": "train", "step": step+1, "loss": round(float(totals[0]/totals[1]), 6),
+                  "accuracy": round(float(totals[2]/totals[1]), 4), "grad_norm": round(float(norm), 4),
+                  "tokens_per_second": round(window_steps*args.grad_accum*args.batch_size*parallel.dp_size*args.length/float(timing)),
+                  "peak_allocated_gib": round(torch.cuda.max_memory_allocated(device)/GiB, 3) if device.type == "cuda" else None,
+                  "peak_reserved_gib": round(torch.cuda.max_memory_reserved(device)/GiB, 3) if device.type == "cuda" else None}, args, parallel.rank)
             stats.zero_()
             last_time, window_steps = time.perf_counter(), 0
         should_stop = False
         if args.eval_every and ((step+1) % args.eval_every == 0 or step == args.steps-1):
             evaluation_start = time.perf_counter()
-            rec = evaluate(args, model, parallel, validation_dataset, during_training=True)
+            rec = evaluate(args, model, parallel, validation_dataset, during_training=True, step=step+1)
             model.train()
             should_stop = args.stop_exact is not None and rec["exact"] >= args.stop_exact
             last_time += time.perf_counter()-evaluation_start
         if args.save and (should_stop or step == args.steps-1 or args.save_every and (step+1) % args.save_every == 0):
             ckpt.save(args.save, model, opt, config, step, generator, parallel)
         if should_stop:
-            emit({"event": "early_stop", "step": step+1, "exact": rec["exact"]}, args, parallel.rank)
+            emit({"event": "early_stop", "step": step+1, "exact": round(rec["exact"], 4)}, args, parallel.rank)
             break
 
 
 @torch.no_grad()
-def evaluate(args, model, parallel, dataset, during_training=False):
+def evaluate(args, model, parallel, dataset, during_training=False, step=None):
     model.eval()
     if args.precision == "bf16" and not during_training:
         model.to(torch.bfloat16)
@@ -208,7 +206,8 @@ def evaluate(args, model, parallel, dataset, during_training=False):
         with session_context as session:
             if session is not None:
                 session.prefill(ids, positions)
-                emit({"event": "inference_plan", "batch": batch_index, **session.plan.to_dict()}, args, parallel.rank)
+                if batch_index == 0:
+                    emit({"event": "inference_plan", "batch": batch_index, **session.plan.to_dict()}, args, parallel.rank)
                 iterator = session.iter_logits()
             else:
                 device = next(model.parameters()).device
@@ -222,11 +221,12 @@ def evaluate(args, model, parallel, dataset, during_training=False):
                 errors += (~hit).sum(1).cpu()
         exact += int((errors == 0).sum())
         rows_total += args.batch_size
-    result = {"event": "eval", "length": args.length, "loss": loss_sum/count,
-              "bpc": loss_sum/count/math.log(2), "accuracy": correct/count,
-              "exact": exact/rows_total, "evaluated_tokens": count,
-              "seconds": time.perf_counter()-begin,
-              "peak_allocated_gib": torch.cuda.max_memory_allocated()/GiB if next(model.parameters()).is_cuda else None}
+    result = {"event": "eval", **({"step": step} if step is not None else {}),
+              "length": args.length, "loss": round(loss_sum/count, 6),
+              "bpc": round(loss_sum/count/math.log(2), 6), "accuracy": round(correct/count, 4),
+              "exact": round(exact/rows_total, 4), "evaluated_tokens": count,
+              "seconds": round(time.perf_counter()-begin, 3),
+              "peak_allocated_gib": round(torch.cuda.max_memory_allocated()/GiB, 3) if next(model.parameters()).is_cuda else None}
     emit(result, args, parallel.rank)
     if args.output and parallel.rank == 0 and not during_training:
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
@@ -283,9 +283,14 @@ def run(args):
     parallel = ParallelContext.initialize(cp, args.device)
     try:
         estimate = training_estimate(model, args.batch_size, args.length, cp, args.checkpoint_chunks)
+        estimate.pop("note")
+        hint = None
+        if world == 1 and args.device == "cuda" and torch.cuda.device_count() > 1:
+            hint = (f"{torch.cuda.device_count()} GPUs are visible; "
+                    "launch with torchrun --nproc_per_node=N to train on all of them")
         emit({"event": "configuration", "model": options, "world": world, "cp": cp,
               "dp": parallel.dp_size, "effective_batch": args.batch_size*parallel.dp_size*args.grad_accum,
-              **estimate}, args, parallel.rank)
+              **estimate, **({"hint": hint} if hint else {})}, args, parallel.rank)
         if args.command == "train" and device.type == "cuda" and estimate["estimated_total_bytes"] > capacity*args.memory_fraction and not args.allow_over_budget:
             raise MemoryError("training estimate exceeds memory budget; reduce microbatch/use CP/checkpointing, or inspect --allow-over-budget")
         if args.task in ("passkey", "copying", "mqar") and args.vocab_size < data.VOCAB:
