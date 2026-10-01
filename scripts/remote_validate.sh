@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 # Run from the repository root on the remote NVIDIA machine. No installs,
 # downloads, shutdowns, or destructive operations are performed.
@@ -7,6 +8,7 @@ GPUS=${GPUS:-1}
 REPORT_DIR=${REPORT_DIR:-runs/validation}
 mkdir -p "$REPORT_DIR"
 python -m st validate --suite reference --output "$REPORT_DIR/reference.json" 2>&1 | tee "$REPORT_DIR/reference.log"
+python -m st validate --suite resources --output "$REPORT_DIR/resources.json" 2>&1 | tee "$REPORT_DIR/resources.log"
 python -m st validate --suite cuda --output "$REPORT_DIR/cuda.json" 2>&1 | tee "$REPORT_DIR/cuda.log"
 
 if [ "$GPUS" -ge 2 ]; then

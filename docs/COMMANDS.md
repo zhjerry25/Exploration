@@ -26,7 +26,7 @@ JSON 的根节点只有 `model` 和 `runtime`，键名用下划线，例如 `bat
 | `--batch-size` | 每个 DP replica 的 microbatch，不是每张 CP GPU 的独立 batch |
 | `--grad-accum` | 累积 microbatch 数 |
 | `--precision bf16 / fp32` | 训练 bf16 autocast / fp32；独立推理使用相应权重与缓存 dtype |
-| `--backend auto / triton / torch` | auto 对不支持的布局用 bounded torch 路径；Triton 编译/数值错误不会被吞掉 |
+| `--backend auto / triton / torch` | auto 对不支持的布局用 bounded torch 路径；Triton 资源不足时切换小 tile Triton，编译/数值错误不会被吞掉 |
 | `--context-parallel auto / N` | N 必须整除进程数和 heads；auto 是启发式规划，不是性能调优结果 |
 | `--[no-]checkpoint-chunks` | 局部计算和 vocabulary head 的激活重计算 |
 | `--[no-]optimizer-shard` | 多卡 ZeRO-1；默认启用 |
@@ -124,10 +124,61 @@ StackModel 独立评测时，所有 rank 协同处理同一 prompt 的不同 KV 
 
 合成检索任务默认只评价答案位置。LM 默认全位置；在 16M/32M 上对每个 token 进行精确 query-written block scoring，计算量仍然是二次增长。仅研究长上下文上的少数查询时应显式设置 `--eval-positions`，并在结果中区分抽样和完整 LM 评测。
 
-## 验证与性能
+## Benchmark：算子性能与模型性能
+
+算子 benchmark 不加载模型/checkpoint，不读取语料，只测随机 Q/K/V 上的 attention。
+用一张 NVIDIA GPU，直接运行 `python -m st benchmark`。不要对这个子命令使用多进程
+`torchrun`；多卡模型性能用下面的 `train --task random`。
+
+```bash
+# 512 长度，bf16，同输入比较三个 dense 实现
+python -m st benchmark --compare --length 512
+# sparse 比较仅包括 torch 和 triton
+python -m st benchmark --compare --operation sparse --length 4096 --queries 16
+# 大模型头维度和 128-token block 的 FP32 资源回归性能
+python -m st benchmark --length 385 --queries 5 --head-dim 128 \
+  --block-size 128 --precision fp32 --iterations 20
+```
+
+| 参数 | 默认值与含义 |
+|---|---|
+| `--operation dense/sparse` | dense：前向+反向；sparse：前向（scoring、top-k、pop） |
+| `--backend triton/torch/eager` | 默认 triton；eager 仅适合小规模 dense 对照 |
+| `--compare` | 固定种子、尺寸和精度，顺序测试可用的对照实现 |
+| `--length` | KV token 数，默认 512 |
+| `--queries` | dense 默认全部位置；sparse 默认最后最多 16 个位置 |
+| `--batch-size`, `--heads`, `--head-dim` | 默认 1、4、64；head-dim 是每头维度，不是总 dim |
+| `--block-size`, `--topk` | 默认 16、64；topk 只控制 sparse |
+| `--precision bf16/fp32` | 默认 bf16，FP32 不启用 TF32 |
+| `--page-tokens` | sparse KV 页大小，默认 65536；输入 KV 仍整体驻 GPU |
+| `--warmup`, `--iterations` | 默认 3、10；先预热，再用 CUDA events 计时 |
+| `--output` | 默认 `runs/benchmarks/<operation>-<backend-or-compare>.json` |
+
+终端显示延迟与显存。JSON 保存各次采样、环境、参数、allocated/reserved 峰值、
+实际 kernel 路径和共享内存字节数。`--compare` 顺序执行，不自动跳过失败；如果
+资源或精度不支持，命令会报错。eager 会分配 Q×N，因此先比较 512，再逐步放大。
+
+小 tile 路径主要保证资源兼容，会增加重复读取和计算，速度以报告为准。
+算子 benchmark 的 KV 在 GPU 内存中；要测 CPU/磁盘分页开销，用 `eval --resume ...`
+的 `seconds` 和显存记录，不能用算子结果代替分页推理结果。
+
+完整模型的 optimizer-step 吞吐：
+
+```bash
+torchrun --standalone --nproc_per_node=2 -m st train \
+  --config configs/stack_2m.json --task random --length 8192 \
+  --context-parallel 2 --batch-size 1 --steps 20 --log-every 5 --save '' \
+  --log runs/benchmarks/train-cp2.jsonl
+```
+
+看 JSONL 的 `tokens_per_second`、`peak_allocated_gib`。首次编译会影响首个窗口，
+比较后续稳定窗口。比较 DP/CP 时固定全局有效 batch。该命令不评估学习质量。
+
+## 正确性验证
 
 ```bash
 python -m st validate --suite reference --output runs/validation/reference.json
+python -m st validate --suite resources --output runs/validation/resources.json
 python -m st validate --suite cuda --output runs/validation/cuda.json
 torchrun --standalone --nproc_per_node=2 -m st validate \
   --suite distributed --cp 2 --output runs/validation/cp2.json
@@ -158,4 +209,4 @@ python -m st benchmark --operation sparse --backend triton --length 1048576 \
 | `--prof / --selftest` | `benchmark` / `validate` 子命令；JSONL 含端到端训练吞吐 |
 | `--ema` | 已删除，不读写或应用 EMA |
 
-旧 flags 不保留静默兼容层，错误拼写会直接失败。旧参数权重/checkpoint 兼容层保留在 `st.checkpoint`。`run_synth.sh`、`run_all_E.sh` 已迁移到新入口，移除了自动关机命令；它们仍是长时实验配方，请先通过小规模验收再启动。
+旧 flags 不保留静默兼容层，错误拼写会直接失败。旧参数权重/checkpoint 兼容层保留在 `st.runtime.checkpoint`。实验配方移至 `scripts/experiments/synthetic.sh`、`scripts/experiments/enwik8_and_scaling.sh`；它们仍是长时实验配方，请先通过小规模验收再启动。

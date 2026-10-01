@@ -140,4 +140,6 @@ with InferenceSession(
 
 `TokenDataset(path, dtype="uint16", start=0, stop=None).batch(batch_size, length, generator)` 返回 CPU `(input_ids, targets, mask, None)`。`start/stop` 是 token offset；没有网络访问或隐式语料下载。
 
-研究自定义 attention 时，可从 `st.attention` 导入 `dense_attention`，从 `st.sparse` 导入 `sparse_attention`/`TensorPages`。这些是低层接口；布局是 `[B,Q,H,D]` 和 `[B,N,H,D]`，positions 是 `[B,Q]`，`-1` 表示 dummy query。dense 算子提供一阶梯度，不支持二阶导数。Triton 支持 fp16/bf16/fp32、每头维度不超过 256、block_size 为 2–128 的 2 的幂；其他配置使用 torch reference/fallback，明确指定 `backend="triton"` 时不支持的配置会报错。
+研究自定义 attention 时，可从 `st.ops.attention` 导入 `dense_attention`，从 `st.ops.sparse` 导入 `sparse_attention`/`TensorPages`。这些是低层接口；布局是 `[B,Q,H,D]` 和 `[B,N,H,D]`，positions 是 `[B,Q]`，`-1` 表示 dummy query。dense 算子提供一阶梯度，不支持二阶导数。Triton 支持 fp16/bf16/fp32、每头维度不超过 256、block_size 为 2–128 的 2 的幂；其他配置使用 torch reference/fallback，明确指定 `backend="triton"` 时不支持的配置会报错。
+
+目录重组不改变上述顶层 API。旧 `st.blocks`、`st.stack_model`、`st.baseline`、`st.attention`、`st.sparse`、`st.parallel`、`st.inference`、`st.checkpoint`、`st.memory`、`st.token_data` 模块导入保留别名，指向同一实现。底层 Triton 文件属于内部接口，现位于 `st/ops/kernels/`。

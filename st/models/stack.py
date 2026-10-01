@@ -68,8 +68,8 @@ from torch.utils.checkpoint import checkpoint
 
 from .blocks import (HaloMemoryBlock, RotaryEmbedding, FeedForward,
                      KVProjection, _gather_heads)
-from .attention import dense_attention
-from .parallel import ParallelContext
+from ..ops.attention import dense_attention
+from ..runtime.parallel import ParallelContext
 
 
 def parse_arch(arch):
@@ -419,7 +419,7 @@ class StackModel(nn.Module):
                 if dense:
                     z = self._dense_round(rd, z, raw_k, raw_v, pc, ParallelContext())
                 elif not torch.is_grad_enabled():
-                    from .sparse import sparse_attention, TensorPages
+                    from ..ops.sparse import sparse_attention, TensorPages
                     q = rd.wq(rd.q_norm(z)).reshape(batch, z.shape[1], self.heads, self.hd)
                     ctx = sparse_attention(q, TensorPages(raw_k, raw_v,
                                            page_tokens=max(b, 65536//b*b)),

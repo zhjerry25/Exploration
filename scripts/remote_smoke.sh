@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
 GPUS=${GPUS:-1}
 REPORT_DIR=${REPORT_DIR:-runs/smoke}
 mkdir -p "$REPORT_DIR"

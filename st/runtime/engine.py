@@ -12,15 +12,15 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from . import checkpoint as ckpt
-from . import data
+from .. import data
 from .inference import InferenceSession
 from .memory import GiB, training_estimate
 from .parallel import ParallelContext, sum_all
-from .stack_model import StackModel
-from .baseline import BaselineModel
-from .api import build_model
-from .config import ModelConfig, ExecutionConfig
-from .token_data import TokenDataset, enwik8_dataset
+from ..models.stack import StackModel
+from ..models.baseline import BaselineModel
+from ..api import build_model
+from ..config import ModelConfig, ExecutionConfig
+from ..data.tokens import TokenDataset, enwik8_dataset
 
 
 def model_options(args):

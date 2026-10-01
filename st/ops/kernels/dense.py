@@ -6,7 +6,7 @@ separate owners, avoiding fp32 atomics and an O(Q N) allocation. No dropout.
 import torch
 import triton as tr
 import triton.language as tl
-from .launch import launch
+from .launch import ResourceExhausted, launch
 
 
 @tr.jit
@@ -182,9 +182,19 @@ def _backward_kv(Q, K, V, POS, DO, ZR, Z, DELTA, RHO, DK, DV,
     tl.store(DV + kp[:, None] + d[None, :], dv, km)
 
 
+def _dispatch(operation, force_streamed, kernel, grid, args, meta, batch, device, dtype):
+    if not force_streamed:
+        try:
+            return launch(kernel, grid, args, meta, device, dtype)
+        except ResourceExhausted:
+            pass  # Resource failures occur before execution; errors of other kinds propagate.
+    from .streamed import run_streamed
+    return run_streamed(operation, args, meta, batch, device, dtype)
+
+
 class _Dense(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, pos, block_size):
+    def forward(ctx, q, k, v, pos, block_size, force_streamed):
         q, k, v, pos = (t.contiguous() for t in (q, k, v, pos))
         batch, queries, heads, dim = q.shape
         out = torch.empty_like(q)
@@ -195,8 +205,9 @@ class _Dense(torch.autograd.Function):
         meta = dict(SQ=queries, SK=k.shape[1], H=heads, D=dim, B=block_size,
                     DM=max(16, tr.next_power_of_2(dim)), M=tile_m, N=tile_n,
                     SCALE=dim ** -0.5)
-        launch(_forward, lambda c: (tr.cdiv(queries, c["M"]), batch*heads),
-               (q, k, v, pos, out, rc, pr, zr, z), meta, q.device, q.dtype)
+        _dispatch("forward", force_streamed, _forward, lambda c: (tr.cdiv(queries, c["M"]), batch*heads),
+               (q, k, v, pos, out, rc, pr, zr, z), meta, batch, q.device, q.dtype)
+        ctx.force_streamed = force_streamed
         ctx.save_for_backward(q, k, v, pos, out, rc, pr, zr, z)
         ctx.meta = meta
         return out
@@ -211,14 +222,14 @@ class _Dense(torch.autograd.Function):
         batch, queries, heads, dim = q.shape
         _preprocess[(batch * queries * heads,)](out, rc, pr, grad, delta, rho,
             TOTAL=batch * queries * heads, D=dim, DM=tr.next_power_of_2(dim))
-        launch(_backward_q, lambda c: (tr.cdiv(queries, c["M"]), batch*heads),
-               (q, k, v, pos, grad, zr, z, delta, rho, dq), ctx.meta, q.device, q.dtype)
-        launch(_backward_kv, lambda c: (tr.cdiv(k.shape[1], c["N"]), batch*heads),
-               (q, k, v, pos, grad, zr, z, delta, rho, dk, dv), ctx.meta, q.device, q.dtype)
-        return dq, dk, dv, None, None
+        _dispatch("dq", ctx.force_streamed, _backward_q, lambda c: (tr.cdiv(queries, c["M"]), batch*heads),
+               (q, k, v, pos, grad, zr, z, delta, rho, dq), ctx.meta, batch, q.device, q.dtype)
+        _dispatch("dkv", ctx.force_streamed, _backward_kv, lambda c: (tr.cdiv(k.shape[1], c["N"]), batch*heads),
+               (q, k, v, pos, grad, zr, z, delta, rho, dk, dv), ctx.meta, batch, q.device, q.dtype)
+        return dq, dk, dv, None, None, None
 
 
-def dense_triton(q, k, v, positions, block_size):
+def dense_triton(q, k, v, positions, block_size, *, force_streamed=False):
     if q.dtype != k.dtype or q.dtype != v.dtype:
         raise ValueError("q/k/v must use the same dtype")
-    return _Dense.apply(q, k, v, positions, block_size)
+    return _Dense.apply(q, k, v, positions, block_size, force_streamed)

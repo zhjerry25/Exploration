@@ -13,7 +13,7 @@ import torch
 import torch.distributed as dist
 
 from .memory import plan_inference
-from .sparse import TensorPages, sparse_attention
+from ..ops.sparse import TensorPages, sparse_attention
 
 
 class KVCache(TensorPages):

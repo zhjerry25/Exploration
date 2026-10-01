@@ -18,12 +18,12 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from .attention import dense_attention
-from .baseline import BaselineModel
-from .inference import InferenceSession
-from .parallel import ParallelContext, sum_all
-from .sparse import TensorPages, sparse_attention
-from .stack_model import StackModel
+from ..ops.attention import dense_attention
+from ..models.baseline import BaselineModel
+from ..runtime.inference import InferenceSession
+from ..runtime.parallel import ParallelContext, sum_all
+from ..ops.sparse import TensorPages, sparse_attention
+from ..models.stack import StackModel
 
 
 def environment():
@@ -32,7 +32,8 @@ def environment():
     if torch.cuda.is_available():
         record["gpus"] = [{"name": torch.cuda.get_device_name(i),
                            "memory_bytes": torch.cuda.get_device_properties(i).total_memory,
-                           "capability": torch.cuda.get_device_capability(i)} for i in range(torch.cuda.device_count())]
+                           "capability": torch.cuda.get_device_capability(i),
+                           "shared_memory_per_block_optin": getattr(torch.cuda.get_device_properties(i), "shared_memory_per_block_optin", None)} for i in range(torch.cuda.device_count())]
     try:
         import triton
         record["triton"] = triton.__version__
@@ -43,7 +44,7 @@ def environment():
 
 def reference_suite():
     torch.set_num_threads(2)
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[2]
     if not (root/"tests").is_dir():
         raise RuntimeError("reference validation requires the source checkout, including tests/")
     suite = unittest.defaultTestLoader.discover(str(root/"tests"), top_level_dir=str(root))
@@ -60,18 +61,23 @@ def error_metrics(actual, expected):
             "relative_rms": float(difference.square().mean().sqrt()/expected.float().square().mean().sqrt().clamp_min(1.e-8))}
 
 
-def cuda_suite():
+def cuda_suite(resources_only=False):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA suite requires an NVIDIA GPU")
     import triton  # required, not optional for this suite
     from tests.test_attention import eager_attention
+    from ..ops.kernels.dense import dense_triton
+    from ..ops.kernels.sparse import block_scores
+    from ..ops.sparse import _score_torch
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.manual_seed(772)
     results = []
     # Partial tails, empty remote sets, non-power-of-two D, all supported
     # block-size extremes, multiple batches/heads, and dummy query rows.
     cases = [(17, 2, 16), (129, 16, 32), (257, 32, 64), (193, 64, 96),
-             (385, 128, 128), (131, 16, 256)]
+             (385, 128, 128), (131, 16, 256), (385, 128, 256)]
+    if resources_only:
+        cases = [(385, 128, 128), (385, 128, 256), (193, 64, 96)]
     for dtype in (torch.float32, torch.bfloat16):
         if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
             raise RuntimeError("bf16 support is required for the target validation matrix")
@@ -97,7 +103,26 @@ def cuda_suite():
                       "gradients": [error_metrics(a, e) for a, e in zip(ag, eg)]}
             results.append(record)
             print(json.dumps(record), flush=True)
+            # Force the smaller tile path even on GPUs whose matrix kernels fit.
+            streamed = dense_triton(q, k, v, pos, b, force_streamed=True)
+            sg = torch.autograd.grad((streamed*probe).sum(), (q, k, v))
+            torch.testing.assert_close(streamed.float(), expected, atol=atol, rtol=rtol)
+            for a, e in zip(sg, eg):
+                torch.testing.assert_close(a.float(), e, atol=atol, rtol=rtol)
+            record = {"operation": "streamed_dense", "dtype": str(dtype), "n": n,
+                      "block": b, "head_dim": d, "forward": error_metrics(streamed, expected),
+                      "gradients": [error_metrics(a, e) for a, e in zip(sg, eg)]}
+            results.append(record)
+            print(json.dumps(record), flush=True)
             with torch.no_grad():
+                # Nonzero page offset, partial tail, empty remote sets and dummy rows.
+                offset = 2*b
+                shifted = torch.where(pos >= 0, pos+offset, pos)
+                score = block_scores(q, k, shifted, b, offset, force_streamed=True)
+                reference_score = _score_torch(q, k, shifted, b, offset)
+                torch.testing.assert_close(score, reference_score, atol=atol, rtol=rtol)
+                results.append({"operation": "streamed_scores", "dtype": str(dtype),
+                                "n": n, "block": b, "head_dim": d, "offset": offset})
                 keep = 2
                 expected_sparse = eager_attention(rq, rk, rv, pos, b, keep)
                 sparse, selection = sparse_attention(q.detach(), TensorPages(k.detach(), v.detach(), 4*b),
@@ -107,6 +132,9 @@ def cuda_suite():
                           "head_dim": d, **error_metrics(sparse, expected_sparse)}
                 results.append(record)
                 print(json.dumps(record), flush=True)
+    if resources_only:
+        from ..ops.kernels.launch import launch_report
+        return {"cases": results, "kernel_launches": launch_report()}
     # End-to-end weights, chunked CE and checkpoint recomputation.
     torch.manual_seed(42)
     model = StackModel(128, 64, 4, 16, 64, "Lx2,(G)x2", backend="triton",
@@ -128,7 +156,7 @@ def cuda_suite():
             torch.testing.assert_close(a.grad, e.grad, atol=.08, rtol=.06, msg=name)
             gradient_error[name] = error_metrics(a.grad, e.grad)
     results.append({"operation": "end_to_end_bf16", "loss": error_metrics(actual, expected), "gradients": gradient_error})
-    from .kernels.launch import launch_report
+    from ..ops.kernels.launch import launch_report
     return {"cases": results, "kernel_launches": launch_report()}
 
 
@@ -206,24 +234,29 @@ def distributed_suite(cp_size):
         dist.destroy_process_group()
 
 
-def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--suite", choices=["reference", "cuda", "distributed"], required=True)
+def parser():
+    p = argparse.ArgumentParser(prog="python -m st validate", description=__doc__, allow_abbrev=False)
+    p.add_argument("--suite", choices=["reference", "resources", "cuda", "distributed"], required=True)
     p.add_argument("--cp", type=int, default=2)
     p.add_argument("--output", default="validation.json")
+    return p
+
+
+def main(argv=None):
+    p = parser()
     args = p.parse_args(argv)
     report = {"environment": environment(), "suite": args.suite, "passed": False}
     start = time.perf_counter()
     error = None
     try:
         report["results"] = (reference_suite() if args.suite == "reference" else
-                             cuda_suite() if args.suite == "cuda" else distributed_suite(args.cp))
+                             cuda_suite(resources_only=args.suite == "resources") if args.suite in ("cuda", "resources") else distributed_suite(args.cp))
         report["passed"] = True
     except BaseException:
         error = traceback.format_exc()
         report["error"] = error
-        if "st.kernels.launch" in sys.modules:
-            from .kernels.launch import launch_report
+        if "st.ops.kernels.launch" in sys.modules:
+            from ..ops.kernels.launch import launch_report
             report["kernel_launches"] = launch_report()
     report["seconds"] = time.perf_counter()-start
     rank = int(os.environ.get("RANK", "0"))

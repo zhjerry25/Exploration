@@ -1,10 +1,10 @@
 """Public construction/loading API, independent of CLI and task generators."""
 import torch
 
-from .baseline import BaselineModel
+from .models.baseline import BaselineModel
 from .config import ModelConfig, ExecutionConfig
-from .stack_model import StackModel
-from . import checkpoint
+from .models.stack import StackModel
+from .runtime import checkpoint
 
 
 def build_model(config=ModelConfig(), *, execution=ExecutionConfig(), device="cpu", dtype=None):

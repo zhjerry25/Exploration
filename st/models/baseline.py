@@ -15,7 +15,7 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .blocks import RotaryEmbedding, FeedForward
-from .parallel import ParallelContext
+from ..runtime.parallel import ParallelContext
 
 
 class BaselineBlock(nn.Module):

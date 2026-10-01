@@ -1,60 +1,110 @@
 # Stack experiments
 
-统一的 dense 训练 / sparse 推理实验框架。模型和底层算子可单独作为 Python 库使用；所有实验使用同一个命令入口。
+Dense 训练、sparse 推理的实验框架。**所有命令都从 `python -m st` 开始。**
+在仓库根目录运行；不需要知道内部 Python 文件的位置。
+
+| 想做什么 | 命令 |
+|---|---|
+| 看有哪些命令 | `python -m st --help` |
+| 看模型大小和显存估算 | `python -m st plan --config configs/stack_2m.json` |
+| 训练 | `python -m st train --help` |
+| 加载 checkpoint 评测 | `python -m st eval --help` |
+| 验证正确性 | `python -m st validate --help` |
+| 测 attention 速度和显存 | `python -m st benchmark --help` |
+
+## 环境
+
+远程机器需要支持该 NVIDIA GPU 的 CUDA PyTorch 与配套 Triton；接口最低要求为
+Python 3.10、PyTorch 2.5，但这些最低版本不保证支持新款 GPU。使用已匹配的环境。
+可选安装 `python -m pip install --no-deps -e .`，随后也能使用 `stack-experiment` 命令。
+
+## 先验证，再开始实验
 
 ```bash
-python -m st --help
-python -m st train --help
-python -m st eval --help
-python -m st validate --help
+python -m st validate --suite reference --output runs/validation/reference-v3.json
+# 快速复测此前 D=128/B=128 的 shared-memory 失败及小 tile 的前后向
+python -m st validate --suite resources --output runs/validation/resources-v3.json
+# 完整单卡 CUDA 矩阵
+python -m st validate --suite cuda --output runs/validation/cuda-v3.json
 ```
 
-训练固定使用精确 dense block-gated attention，`topk` 只控制推理。支持 1–8 个进程的 DP、CP 和组合并行、分块 checkpoint、梯度累积及 ZeRO-1。长上下文推理逐页编码，raw KV 可放在 GPU、CPU 或磁盘；查询状态超过内存预算时也可落盘。
+多卡验证：`GPUS=2 bash scripts/remote_validate.sh`，将 2 改为实际可用的 1/2/4/8。
+验证通过后，`GPUS=2 bash scripts/remote_smoke.sh` 检查训练、保存和重载流程。
 
-## 开始使用
-
-在远程 NVIDIA 环境中安装与 GPU/驱动兼容的 CUDA PyTorch 和配套 Triton。代码最低接口要求是 Python 3.10、PyTorch 2.5；这不代表任何旧版本的 CUDA wheel 都支持新 GPU。使用环境自带的匹配版本，然后可选择安装本项目：
-
-```bash
-python -m pip install --no-deps -e .
-```
-
-安装后 `stack-experiment` 与 `python -m st` 调用完全相同的入口。在源码仓库根目录使用后者不需要安装本项目。CPU 可运行 reference 验证；生产执行面向 NVIDIA CUDA。
+## 训练与评测
 
 ```bash
-# 只规划参数量和显存，不分配完整模型参数，也不要求 GPU
-python -m st plan --config configs/stack_500m.json --length 65536
-
-# MQAR dense 训练，2.4M 参数
+# 单卡 MQAR；topk 不改变训练，训练始终 dense
 python -m st train --config configs/stack_2m.json --task mqar \
   --length 512 --npairs 16 --nqueries 16 --batch-size 16 \
-  --steps 3000 --lr 5e-4 --eval-every 500 --stop-exact .99 \
-  --save runs/mqar512.pt --log runs/mqar512.jsonl
+  --steps 3000 --eval-every 500 --save runs/mqar.pt --log runs/mqar.jsonl
 
-# 多卡 dense LM 训练：无外部数据时用 random 检查吞吐流程
-torchrun --standalone --nproc_per_node=8 -m st train \
-  --config configs/stack_500m.json --task random --length 65536 \
-  --context-parallel 8 --batch-size 1 --grad-accum 4 \
-  --steps 20 --log-every 1 --save runs/large-smoke.pt
-
-# 加载旧或新 checkpoint，在 16M 位置范围做 sparse 检索评测
-python -m st eval --resume runs/mqar512.pt --task mqar \
-  --length 16777216 --npairs 16 --nqueries 16 --batch-size 1 \
-  --cache auto --cache-dir /path/to/fast-local-disk/stack-cache \
-  --output runs/mqar16m.json
+# 加载权重做 sparse 外推；自动选择 GPU/CPU/磁盘缓存
+python -m st eval --resume runs/mqar.pt --task mqar \
+  --length 1048576 --npairs 16 --nqueries 16 --batch-size 1 \
+  --cache auto --cache-dir runs/cache --output runs/mqar-1m.json
 ```
 
-`random` 只用于工程测试，不能证明语言建模或检索质量。模型 preset 名称是参数规模标签，准确参数量以 `plan` 输出为准。
+## Benchmark 怎么跑
 
-## 文档
+**不需要 checkpoint 或训练数据，算子 benchmark 用固定随机输入。** 在一张 GPU 上运行：
 
-- [完整命令、数据和迁移说明](docs/COMMANDS.md)
+```bash
+# 一条命令比较 eager、bounded torch、Triton 的 dense 前向+反向
+python -m st benchmark --compare --length 512
+
+# 单独测 dense 前向+反向；默认 queries=length
+python -m st benchmark --operation dense --length 4096 --precision bf16
+
+# 单独测长上下文 sparse 前向；只查询 16 个位置
+python -m st benchmark --operation sparse --length 1048576 --queries 16 --topk 64
+
+# 对此前失败的 FP32 配置单独计时
+python -m st benchmark --operation dense --length 385 --queries 5 \
+  --head-dim 128 --block-size 128 --precision fp32
+```
+
+终端显示毫秒延迟和显存，完整报告自动保存到 `runs/benchmarks/`；`--output PATH`
+可改位置。报告包含实际 kernel 路径与共享内存用量。预热不计入延迟。
+`--compare` 从小长度开始，eager 会物化 Q×N 分数。
+
+**完整模型训练吞吐**用下面的命令，读日志中的 `tokens_per_second`：
+
+```bash
+torchrun --standalone --nproc_per_node=2 -m st train \
+  --config configs/stack_2m.json --task random --length 8192 \
+  --context-parallel 2 --batch-size 1 --steps 20 --log-every 5 --save '' \
+  --log runs/benchmarks/train-cp2.jsonl
+```
+
+`random` 只测工程性能，不证明任务质量；算子毫秒数也不代表完整训练吞吐。
+
+## 目录
+
+```text
+configs/              2M / 100M / 500M 模型预设
+st/
+  api.py, config.py   外部接口：build_model / load_model / 配置
+  cli.py              统一命令路由
+  models/             StackModel、baseline、局部 blocks
+  ops/                dense/sparse 算子，kernels/ 为 Triton 实现
+  runtime/            训练、并行、checkpoint、分页推理、容量规划
+  data/               合成任务与 mmap token 文件
+  tools/              validate 与 benchmark
+scripts/              远程验收；experiments/ 为长时实验配方
+tests/                正确性回归测试
+docs/                 详细说明；research/ 保存历史研究记录
+data/, runs/          本地语料与输出，不纳入版本控制
+```
+
+- [完整命令、并行训练、数据与续训](docs/COMMANDS.md)
 - [公共 Python API](docs/API.md)
-- [并行、算子语义和显存设计](docs/ARCHITECTURE.md)
-- [验收状态与远程复测](docs/VALIDATION.md)
+- [算法、并行与资源设计](docs/ARCHITECTURE.md)
+- [已验证结果与尚待验收的项目](docs/VALIDATION.md)
 
-旧 `st/train.py`、旧 `st/run.py` 和会隐式下载语料的 `st/lmdata.py` 已删除。训练/评测仅由 `st/engine.py` 执行，命令解析仅由 `st/cli.py` 执行。EMA 已移除。旧 checkpoint 的结构和权重仍可加载；历史实验结果文件保留原始记录，不能当作当前实现的验收报告。
+`from st import StackModel, build_model, load_model, InferenceSession` 等公共接口保持不变。
+旧 checkpoint 仍可加载，旧 Python 模块导入通过别名转到唯一实现。
 
-## 验证边界
-
-用户回报的并轨前版本通过了 38 项 reference 测试，及前三组 FP32 CUDA 数值用例。随后在 `head_dim=96 / block_size=64` 的 dense kernel 启动时出现共享内存超限。当前版本已修改启动策略，并新增统一入口与 API 回归测试；**修复后的完整 CUDA、多卡、65k 训练和 16M/32M 外推仍需远程验证**。目前没有可据此宣称的整体加速倍数或全规模通过结论。
+目前收到的 CUDA v2 回报仍在 FP32 D=128/B=128 处失败。当前修订已加入完整 block
+跨小 tile 归约的 Triton 路径，**尚待远程验证**；不能据此宣称全部 GPU、65k 训练和
+16M/32M 外推已通过，也没有已验证的整体加速倍数。

@@ -6,13 +6,15 @@ microbenchmark measures the attention operator only, including dense backward.
 import argparse
 import json
 import math
+import os
+import sys
 from pathlib import Path
 
 import torch
 
-from .attention import dense_attention
-from .memory import GiB
-from .sparse import TensorPages, sparse_attention
+from ..ops.attention import dense_attention
+from ..runtime.memory import GiB
+from ..ops.sparse import TensorPages, sparse_attention
 from .validate import environment
 
 
@@ -35,8 +37,12 @@ def dense_eager(q, k, v, positions, block_size):
     return (probs @ v.transpose(1, 2).float()).transpose(1, 2).to(q.dtype)
 
 
-def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__)
+def parser():
+    p = argparse.ArgumentParser(prog="python -m st benchmark", description=__doc__, allow_abbrev=False)
+    p.epilog = ("Examples: python -m st benchmark --compare --length 512 | "
+                "python -m st benchmark --operation sparse --length 1048576 --queries 16. "
+                "For full-model training throughput, use python -m st train --task random.")
+    p.add_argument("--compare", action="store_true", help="same inputs: compare eager/torch/triton (sparse: torch/triton)")
     p.add_argument("--operation", choices=["dense", "sparse"], default="dense")
     p.add_argument("--backend", choices=["triton", "torch", "eager"], default="triton")
     p.add_argument("--length", type=int, default=512)
@@ -50,13 +56,21 @@ def main(argv=None):
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--iterations", type=int, default=10)
     p.add_argument("--page-tokens", type=int, default=65536)
-    p.add_argument("--output", default="")
-    args = p.parse_args(argv)
+    p.add_argument("--output", default="", help="JSON path; default runs/benchmarks/<operation>-<backend-or-compare>.json")
+    return p
+
+
+def measure(args):
+    p = parser()
     if not torch.cuda.is_available():
         p.error("benchmark requires a remote NVIDIA GPU")
-    if min(args.length, args.batch_size, args.heads, args.head_dim, args.block_size, args.iterations, args.topk) < 1 or args.warmup < 0:
-        p.error("dimensions/iterations must be positive, warmup nonnegative")
+    if min(args.length, args.batch_size, args.heads, args.head_dim, args.block_size, args.iterations, args.topk) < 1 or args.warmup < 1 or args.queries < 0 or args.page_tokens < args.block_size:
+        p.error("dimensions/iterations/warmup must be positive, queries >= 0, page_tokens >= block_size")
     queries = args.queries or (args.length if args.operation == "dense" else min(16, args.length))
+    if queries > args.length:
+        p.error("queries must not exceed length")
+    if args.precision == "bf16" and not torch.cuda.is_bf16_supported():
+        p.error("this device does not support bf16; use --precision fp32")
     if args.operation == "sparse" and args.backend == "eager":
         p.error("use torch as the paged sparse reference")
     if args.backend == "eager":
@@ -103,10 +117,38 @@ def main(argv=None):
               "latency_ms_samples": times,
               "peak_allocated_gib": torch.cuda.max_memory_allocated()/GiB,
               "peak_reserved_gib": torch.cuda.max_memory_reserved()/GiB}
-    print(json.dumps(report, indent=2))
-    if args.output:
-        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.output).write_text(json.dumps(report, indent=2)+"\n")
+    report["kernel_launches"] = []
+    if args.backend == "triton" and "st.ops.kernels.launch" in sys.modules:
+        from ..ops.kernels.launch import launch_report
+        report["kernel_launches"] = launch_report()
+    return report
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
+        parser().error("operator benchmark runs on one GPU; use torchrun -m st train for distributed throughput")
+    backends = ((["eager", "torch", "triton"] if args.operation == "dense" else ["torch", "triton"])
+                if args.compare else [args.backend])
+    reports = []
+    for backend in backends:
+        case = argparse.Namespace(**{**vars(args), "backend": backend})
+        # Release inactive allocator blocks from the previous comparison arm.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print(f"Benchmark {args.operation}/{backend}: compiling and warming up...", flush=True)
+        report = measure(case)
+        reports.append(report)
+        print(f"{backend}: median={report['latency_ms_median']:.3f} ms, "
+              f"peak allocated={report['peak_allocated_gib']:.3f} GiB, "
+              f"reserved={report['peak_reserved_gib']:.3f} GiB", flush=True)
+    report = {"comparison": reports} if args.compare else reports[0]
+    label = "compare" if args.compare else args.backend
+    path = Path(args.output or f"runs/benchmarks/{args.operation}-{label}.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2)+"\n")
+    print(f"Report: {path}", flush=True)
+    return report
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ class LaunchPolicyTests(unittest.TestCase):
     def policy(self):
         # Execute only the pure Python launch policy; CUDA calls are replaced
         # with a fake JIT launch to verify retry/exception contracts.
-        path = Path(__file__).resolve().parents[1]/"st/kernels/launch.py"
+        path = Path(__file__).resolve().parents[1]/"st/ops/kernels/launch.py"
         tree = ast.parse(path.read_text())
         tree.body = [node for node in tree.body if not isinstance(node, (ast.Import, ast.ImportFrom))]
         class OutOfResources(Exception):
@@ -50,3 +50,38 @@ class LaunchPolicyTests(unittest.TestCase):
                 return call
         with self.assertRaisesRegex(ValueError, "compile failure"):
             policy["launch"](Kernel(), lambda c: (1,), (), {"N": 64, "B": 16}, "cuda:0", "fp32")
+
+    def test_exhausted_matrix_configuration_is_cached(self):
+        policy = self.policy()
+        calls = []
+        class Kernel:
+            __name__ = "large_matrix"
+            def __getitem__(self, grid):
+                def call(*args, **meta):
+                    calls.append(meta)
+                    raise policy["OutOfResources"]("139264 > 101376")
+                return call
+        meta = dict(N=128, B=128, D=128)
+        with self.assertRaises(policy["ResourceExhausted"]):
+            policy["launch"](Kernel(), lambda c: (1,), (), meta, "cuda:0", "fp32")
+        count = len(calls)
+        with self.assertRaises(policy["ResourceExhausted"]):
+            policy["launch"](Kernel(), lambda c: (1,), (), meta, "cuda:0", "fp32")
+        self.assertEqual(len(calls), count)
+        self.assertTrue(all(c["N"] >= c["B"] for c in calls))
+
+    def test_streamed_tile_can_be_smaller_than_model_block(self):
+        policy = self.policy()
+        calls = []
+        class Kernel:
+            __name__ = "streamed"
+            def __getitem__(self, grid):
+                def call(*args, **meta):
+                    calls.append(meta)
+                    if meta["T"] > 16:
+                        raise policy["OutOfResources"]("test tile budget")
+                    return SimpleNamespace(metadata=SimpleNamespace(shared=2048))
+                return call
+        result = policy["launch_streamed"](Kernel(), lambda c: (1,), (), {"B": 128, "D": 256}, "cuda:0", "fp32")
+        self.assertEqual(result["T"], 16)
+        self.assertEqual(policy["launch_report"]()[0]["path"], "streamed_reduction")

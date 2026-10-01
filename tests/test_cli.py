@@ -15,6 +15,33 @@ from st.cli import main, parse_args, entrypoint
 
 
 class UnifiedDriverTests(unittest.TestCase):
+    def test_reorganized_module_aliases(self):
+        import st.blocks
+        import st.stack_model
+        import st.attention
+        from st.models import blocks, stack
+        from st.ops import attention
+        from st import data
+        self.assertIs(st.blocks, blocks)
+        self.assertIs(st.stack_model.StackModel, stack.StackModel)
+        self.assertIs(st.attention.dense_attention, attention.dense_attention)
+        self.assertEqual(data.Q, 31)
+        self.assertEqual(data.KEY, 5)
+
+    def test_command_help_is_scoped_and_no_args_shows_help(self):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            main([])
+        self.assertIn("benchmark", out.getvalue())
+        for command, present, absent in (("eval", "--cache", "--grad-accum"),
+                                         ("plan", "--dim", "--eval-every"),
+                                         ("benchmark", "--compare", "--resume")):
+            with self.subTest(command=command), contextlib.redirect_stdout(io.StringIO()) as out:
+                with self.assertRaises(SystemExit) as caught:
+                    main([command, "--help"])
+                self.assertEqual(caught.exception.code, 0)
+            self.assertIn(present, out.getvalue())
+            self.assertNotIn(absent, out.getvalue())
+
     def test_console_entrypoint_discards_result(self):
         with patch("st.cli.main", return_value={"loss": 1.0}) as driver:
             self.assertIsNone(entrypoint())

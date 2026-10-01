@@ -12,18 +12,33 @@
 
 这些是用户提供的测试结果，不是本地执行结果。没有把旧 reference 通过视为当前并轨版本、全 GPU 矩阵或所有目标规模已经通过。
 
+## CUDA v2 新回报
+
+用户回报：FP32 `D=128 / block_size=128` 的 `_forward` 在全部启动配置重试后仍失败：
+共享内存需求 **139264 bytes > 101376 bytes**。这证明上一轮仅调流水级和 tile 的修复
+不充分；该报错不是整卡显存耗尽，也没有提供 GPU 硬件故障的证据。
+没有收到完整 cuda-v2 JSON，因此不推断其余用例已经通过。
+
 ## 当前修改与最小复测
 
-启动配置改为显式 num_stages，并在资源不足时尝试保持语义的配置；validation JSON 增加成功 kernel 的共享内存和 tile 记录。指标计算使用 detach，消除回报中的 requires_grad 转 scalar 提示。驱动并轨新增 CLI/API/baseline/launch-policy 回归。
+增加完整 block 跨小 tile 归约的 Triton forward/dQ/dK/dV/scoring 路径，保持 gate 语义。
+矩阵路径资源不足时独立切换；编译错误、CUDA OOM 仍失败。目录按 models/ops/runtime/data/tools
+分组，命令改用子命令专属帮助，benchmark 新增同输入比较与默认报告路径。
 
-同步整个当前工作区到远程仓库后：
+同步整个工作区（包括新增文件、目录移动和删除）后，在仓库根目录运行：
 
 ```bash
-python -m st validate --suite reference --output runs/validation/reference-v2.json
-python -m st validate --suite cuda --output runs/validation/cuda-v2.json
+python -m st validate --suite reference --output runs/validation/reference-v3.json
+python -m st validate --suite resources --output runs/validation/resources-v3.json
+python -m st validate --suite cuda --output runs/validation/cuda-v3.json
 ```
 
-不必清空 Triton cache；源码/编译设置变化会产生新的 specialization。若 CUDA 仍失败，请保留最后的 `case_start`、完整 traceback、报告的 `environment` 与 `kernel_launches`。
+`resources` 专门复测 D128/B128、D256/B128、D96/B64，包含自动选择、小 tile 强制执行、
+前向/全部输入梯度、非零页面 offset 的 scoring 和 sparse 输出。完整 `cuda` 还覆盖短 block、
+dummy queries、尾部与端到端 bf16。新测试代码不等于通过记录；当前无远程 v3 结果。
+
+不必清空 Triton cache。若失败，请保留 `case_start`、完整 traceback、报告的 `environment`
+与 `kernel_launches`。本地仅进行静态检查；数值、实际 JIT 编译、资源与性能由远程验证。
 
 ## 后续验收矩阵
 

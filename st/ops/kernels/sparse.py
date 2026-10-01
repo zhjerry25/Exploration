@@ -3,8 +3,7 @@ import torch
 import triton as tr
 import triton.language as tl
 
-from .dense import _block_lse
-from .launch import launch
+from .launch import ResourceExhausted, launch
 
 
 @tr.jit
@@ -79,7 +78,7 @@ def _pop(Q, K, V, POS, IDS, SCORES, ZR, O, LSE, OFFSET,
     tl.store(LSE + row, m+tl.log(den))
 
 
-def block_scores(q, k, positions, block_size, offset=0):
+def block_scores(q, k, positions, block_size, offset=0, *, force_streamed=False):
     q, k, positions = (x.contiguous() for x in (q, k, positions))
     batch, queries, heads, dim = q.shape
     groups = tr.cdiv(k.shape[1], block_size)
@@ -88,8 +87,16 @@ def block_scores(q, k, positions, block_size, offset=0):
     meta = dict(SQ=queries, SK=k.shape[1], H=heads, D=dim, G=groups,
                 B=block_size, DM=max(16, tr.next_power_of_2(dim)),
                 M=m, N=n, SCALE=dim**-0.5)
-    launch(_scores, lambda c: (tr.cdiv(queries, c["M"]), tr.cdiv(k.shape[1], c["N"]), batch*heads),
-           (q, k, positions, scores, offset), meta, q.device, q.dtype)
+    args = (q, k, positions, scores, offset)
+    if not force_streamed:
+        try:
+            launch(_scores, lambda c: (tr.cdiv(queries, c["M"]), tr.cdiv(k.shape[1], c["N"]), batch*heads),
+                   args, meta, q.device, q.dtype)
+            return scores
+        except ResourceExhausted:
+            pass
+    from .streamed import run_streamed
+    run_streamed("scores", args, meta, batch, q.device, q.dtype)
     return scores
 
 

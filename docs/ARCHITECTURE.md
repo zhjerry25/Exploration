@@ -6,9 +6,9 @@
 python -m st / stack-experiment
               │
            st.cli
-              ├── st.engine ── train / eval / plan
-              ├── st.validate
-              └── st.benchmark
+              ├── st.runtime.engine ── train / eval / plan
+              ├── st.tools.validate
+              └── st.tools.benchmark
 
 外部 Python ── st.api ── ModelConfig / ExecutionConfig
                          ├── StackModel
@@ -27,9 +27,24 @@ Torch 版本以显式分块重算实现一阶梯度，并为双精度 oracle 提
 
 ## 共享内存资源适配
 
-kernel 的 shared memory 是每个 thread block 的资源，不是整卡显存。用户回报的失败是 `143424 > 101376` bytes。当前启动器对 fp32 从单流水级开始，对低精度尝试两级；仅当 Triton 在执行前报告 `OutOfResources` 时，调整流水级、warp 数和完整块对齐的 tile 大小，并缓存成功配置。forward、dQ、dK/dV、sparse scoring 独立选择配置。
+kernel 的 shared memory 是单个 thread block 的资源，不是整卡显存。远程 v2
+在 FP32 D=128、B=128 时仍需 139264 bytes，而设备上限为 101376 bytes。
+矩阵路径要求 N ≥ B；因此仅减少流水级/warp 数不能覆盖这个边界。
 
-这不是更改数学定义或自动降精度。编译错误、运行时 CUDA OOM、其他异常不会被捕获成成功。实际编译共享内存字节数进入 validation JSON。分页 absolute offset 改为运行时参数，避免每个 cache 页各编译一套 kernel。
+矩阵路径仍优先运行。仅当所有配置都在启动前报 `OutOfResources` 时，forward、
+dQ、dK/dV、sparse scoring 各自切换到 `st/ops/kernels/streamed.py` 的 Triton 归约路径。
+T 从 32 开始，可重试 16/8；T 与模型 B 无关。先跨 T-token tiles 累积完整 block 的
+log mass 和加权 value 均值，再应用 gate。remote block 的未归一化质量为 M_j²；
+梯度使用完整 block 的 direct-gradient 总和，并保留 −log Z_R 导数。
+
+forward/dQ 每个程序拥有一个 query/head，dK/dV 每个程序拥有不重叠的 key tile/head，
+通过重读 block 统计避免梯度原子写。工作集随 T×D 变化，不分配 Q×N 或 Q×blocks
+中间矩阵。此路径增加读取/归约成本；矩阵路径能运行时继续使用它。实际性能仍需测量。
+
+两条路径都使用 Triton，FP32 不降精度。编译错误、运行时 CUDA OOM 和数值错误仍然
+直接报错。失败的矩阵配置和成功的启动配置会被缓存，避免每次调用重复失败；报告记录
+所用 kernel、tile、流水级和编译共享内存用量。验证会强制测试小 tile 前向和全部输入梯度，
+包括设备本来能运行矩阵路径的情形。分页 absolute offset 使用运行时参数。
 
 ## DP × CP
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 # ─────────────────────────────────────────────────────────────────────────────
 # E 组实验总脚本（train dense infer sparse）
 #
