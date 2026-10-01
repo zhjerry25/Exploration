@@ -83,4 +83,5 @@ done
 
 say "S group experiments over"
 
-# No automatic shutdown.
+# Optional automatic shutdown.
+/usr/bin/shutdown
