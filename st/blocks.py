@@ -11,6 +11,7 @@ for CUDA backends with grid-size limits.
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 FOLD_CHUNK = 8192
@@ -72,55 +73,80 @@ class HaloMemoryBlock(nn.Module):
     """Pre-norm causal attention over [prev block ++ current block] + FFN,
     fully streamed per query chunk (peak memory independent of n)."""
 
-    def __init__(self, dim, heads, block_size, rope, ffn_ratio, query_chunk_size):
+    def __init__(self, dim, heads, block_size, rope, ffn_ratio, query_chunk_size,
+                 checkpoint_chunks=False):
         super().__init__()
         self.heads, self.hd = heads, dim // heads
         self.block_size, self.query_chunk_size = block_size, query_chunk_size
         self.rope = rope
+        self.checkpoint_chunks = checkpoint_chunks
         self.attn_norm = nn.LayerNorm(dim)
         self.qkv = nn.Linear(dim, 3 * dim, bias=False)
         self.out = nn.Linear(dim, dim, bias=False)
         self.ffn_norm = nn.LayerNorm(dim)
         self.ffn = FeedForward(dim, ffn_ratio)
 
-    def forward(self, x, positions):
+    def forward_chunk(self, x, previous=None, start=0):
+        """Encode a block-aligned chunk, using the preceding layer-input block.
+
+        Only the final chunk may have a partial block. This is also the
+        primitive for sequence-parallel halos and out-of-core prefill.
+        Absolute positions are used, including after the 2**24 boundary.
+        """
         batch, n, dim = x.shape
         b = self.block_size
         groups = (n + b - 1) // b
+        if start % b:
+            raise ValueError("halo chunk start must be block aligned")
+        if previous is None:
+            previous = x.new_zeros(batch, b, dim)
+            valid_start = start
+        else:
+            if previous.shape != (batch, b, dim):
+                raise ValueError("previous halo must contain exactly one block")
+            valid_start = max(0, start - b)
+        xs = torch.cat((previous, F.pad(x, (0, 0, 0, groups * b - n))), 1)
+        q, k, v = self.qkv(self.attn_norm(xs)).reshape(
+            batch, (groups + 1) * b, 3, self.heads, self.hd).unbind(2)
+        q = q.reshape(batch, groups + 1, b, self.heads, self.hd)[:, 1:]
+        k = k.reshape(batch, groups + 1, b, self.heads, self.hd)
+        v = v.reshape(batch, groups + 1, b, self.heads, self.hd)
+        kw = torch.cat((k[:, :-1], k[:, 1:]), 2)
+        vw = torch.cat((v[:, :-1], v[:, 1:]), 2)
+        # Use the query block's origin for BOTH q and k. Relative rotations
+        # are unchanged, chunk boundaries cannot affect rounding, and fp32
+        # absolute-position aliasing above 2**24 is avoided.
+        q = self.rope(q, torch.arange(b, device=x.device))
+        kw = self.rope(kw, torch.arange(-b, b, device=x.device))
         offs_q = torch.arange(b, device=x.device)
         offs_k = torch.arange(2 * b, device=x.device)
-        # window entry u of query group g is token (g-1)*b+u; causal: u <= b+w
-        causal = offs_k[None, :] <= b + offs_q[:, None]          # [b,2b]
-        outputs = []
-        for start in range(0, groups, self.query_chunk_size):
-            stop = min(groups, start + self.query_chunk_size)
-            gc = stop - start
-            lo = (start - 1) * b                    # previous block for K/V
-            seg = x[:, max(lo, 0):min(stop * b, n)]
-            left = b if start == 0 else 0           # virtual zero block
-            xs = F.pad(seg, (0, 0, left, (gc + 1) * b - left - seg.shape[1]))
-            pos_s = torch.arange(lo, lo + (gc + 1) * b, device=x.device)
-            q, k, v = self.qkv(self.attn_norm(xs)).reshape(
-                batch, (gc + 1) * b, 3, self.heads, self.hd).unbind(2)
-            q, k = self.rope(q, pos_s), self.rope(k, pos_s)
-            q = q.reshape(batch, gc + 1, b, self.heads, self.hd)[:, 1:]
-            k = k.reshape(batch, gc + 1, b, self.heads, self.hd)
-            v = v.reshape(batch, gc + 1, b, self.heads, self.hd)
-            k_w = torch.cat([k[:, :-1], k[:, 1:]], dim=2)  # [B,gc,2b,H,hd]
-            v_w = torch.cat([v[:, :-1], v[:, 1:]], dim=2)
-            key_pos = (torch.arange(start, stop, device=x.device)[:, None, None]
-                       * b - b + offs_k[None, None, :])    # [gc,1,2b] global
-            valid = (key_pos >= 0) & (key_pos < n)
-            mask = causal[None] & valid                    # [gc,b,2b]
-            outputs.append(_attention(q, k_w, v_w, mask))
-        context = torch.cat(outputs, dim=1).reshape(batch, groups * b, dim)[:, :n]
+        causal = offs_k[None, :] <= b + offs_q[:, None]
+        kp = start + torch.arange(groups, device=x.device)[:, None, None] * b - b + offs_k[None, None, :]
+        mask = causal[None] & (kp >= valid_start) & (kp < start + n)
+        context = _attention(q, kw, vw, mask).reshape(batch, groups * b, dim)[:, :n]
         y = x + self.out(context)
-        zs = []
-        step = self.query_chunk_size * b
-        for s0 in range(0, n, step):                # FFN is position-wise
-            yc = y[:, s0:s0 + step]
-            zs.append(yc + self.ffn(self.ffn_norm(yc)))
-        return torch.cat(zs, dim=1)
+        return y + self.ffn(self.ffn_norm(y))
+
+    def forward(self, x, positions=None, previous=None, start=0):
+        if positions is not None:
+            # Callers use contiguous, absolute token positions.
+            start = int(positions[0])
+        step = self.query_chunk_size * self.block_size
+        parts = []
+        result = torch.empty_like(x) if not torch.is_grad_enabled() else None
+        for lo in range(0, x.shape[1], step):
+            hi = min(lo + step, x.shape[1])
+            prev = previous if lo == 0 else x[:, lo-self.block_size:lo]
+            if self.checkpoint_chunks and torch.is_grad_enabled():
+                y = checkpoint(self.forward_chunk, x[:, lo:hi], prev, start + lo,
+                               use_reentrant=False, preserve_rng_state=False)
+            else:
+                y = self.forward_chunk(x[:, lo:hi], prev, start + lo)
+            if result is None:
+                parts.append(y)
+            else:
+                result[:, lo:hi] = y
+        return torch.cat(parts, 1) if result is None else result
 
 
 class KVProjection(nn.Module):

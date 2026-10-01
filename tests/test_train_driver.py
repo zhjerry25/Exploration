@@ -25,6 +25,12 @@ def cli_args(**over):
 
 
 class TrainDriverTests(unittest.TestCase):
+    def setUp(self):
+        self.original_cwd = os.getcwd()
+
+    def tearDown(self):
+        os.chdir(self.original_cwd)
+
     def test_resume_inherits_checkpoint_structure(self):
         with tempfile.TemporaryDirectory() as td:
             os.chdir(td)

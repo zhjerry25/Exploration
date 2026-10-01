@@ -64,9 +64,12 @@ from numbers import Integral
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .blocks import (HaloMemoryBlock, RotaryEmbedding, FeedForward,
                      KVProjection, _gather_heads)
+from .attention import dense_attention
+from .parallel import ParallelContext
 
 
 def parse_arch(arch):
@@ -125,7 +128,8 @@ class StackModel(nn.Module):
     """forward([B,N], sup=None) -> [B,N,vocab_size]."""
 
     def __init__(self, vocab_size, dim=256, heads=4, block_size=16, topk=64,
-                 arch="Lx2,G", ffn_ratio=4, pos_chunk=0):
+                 arch="Lx2,G", ffn_ratio=4, pos_chunk=0, backend="auto",
+                 checkpoint_chunks=False, encoder_chunk=1024, loss_chunk=128):
         super().__init__()
         integers = {"vocab_size": vocab_size, "dim": dim, "heads": heads,
                     "block_size": block_size, "topk": topk}
@@ -144,6 +148,12 @@ class StackModel(nn.Module):
         self.dim, self.heads, self.hd = dim, heads, dim // heads
         self.block_size, self.topk, self.pos_chunk = block_size, topk, pos_chunk
         self.arch = arch
+        if backend not in ("auto", "torch", "triton"):
+            raise ValueError("backend must be auto, torch, or triton")
+        if encoder_chunk < block_size or loss_chunk < 1:
+            raise ValueError("encoder_chunk >= block_size and loss_chunk > 0 required")
+        self.backend, self.checkpoint_chunks = backend, checkpoint_chunks
+        self.loss_chunk = loss_chunk
         self.embedding = nn.Embedding(vocab_size, dim)
         nn.init.normal_(self.embedding.weight, std=0.02)
         self.rope = RotaryEmbedding(self.hd)
@@ -157,7 +167,8 @@ class StackModel(nn.Module):
                 else:
                     if kind == "L":
                         mod = HaloMemoryBlock(dim, heads, block_size, self.rope,
-                                              ffn_ratio, query_chunk_size=64)
+                                              ffn_ratio, query_chunk_size=max(1, encoder_chunk // block_size),
+                                              checkpoint_chunks=checkpoint_chunks)
                     else:
                         mod = GlobalReadBlock(dim, ffn_ratio)
                     if key is not None:
@@ -169,6 +180,92 @@ class StackModel(nn.Module):
         self.final_norm = nn.LayerNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
         self.lm_head.weight = self.embedding.weight
+
+    def encode_shard(self, input_ids, parallel, offset):
+        x = self.embedding(input_ids)
+        for layer in self.local:
+            halo = parallel.halo(x, self.block_size)
+            x = layer(x, previous=halo, start=offset)
+        raw_k, raw_v = self.raw_kv(x, None)
+        return x, parallel.to_heads(raw_k), parallel.to_heads(raw_v)
+
+    def _dense_round(self, rd, z, k, v, positions, parallel):
+        def project(hidden):
+            return rd.wq(rd.q_norm(hidden))
+        def finish(hidden, context):
+            hidden = hidden + rd.read_out(context)
+            return hidden + rd.ffn(rd.ffn_norm(hidden))
+        use_ckpt = self.checkpoint_chunks and torch.is_grad_enabled()
+        q = (checkpoint(project, z, use_reentrant=False, preserve_rng_state=False)
+             if use_ckpt else project(z)).reshape(*z.shape[:2], self.heads, self.hd)
+        q = parallel.to_heads(q)
+        ctx = dense_attention(q, k, v, positions, self.block_size, self.backend)
+        ctx = parallel.to_sequence(ctx).reshape(*z.shape[:2], self.dim)
+        return (checkpoint(finish, z, ctx, use_reentrant=False, preserve_rng_state=False)
+                if use_ckpt else finish(z, ctx))
+
+    def forward_loss(self, input_ids, targets, sup=None, parallel=None, offset=0):
+        """Always-dense training; return SUM loss and counts, never [B,N,V].
+
+        Inputs are local sequence shards for CP. Every CP peer participates,
+        even when it owns no supervised tokens. The trainer normalizes by
+        the actual global token count before DDP's gradient averaging.
+        """
+        parallel = parallel or ParallelContext()
+        if input_ids.ndim != 2 or input_ids.shape != targets.shape or min(input_ids.shape) < 1:
+            raise ValueError("ids and targets must have identical nonempty [B,N] shape")
+        if self.heads % parallel.cp_size:
+            raise ValueError("heads must be divisible by context_parallel")
+        if sup is None:
+            sup = targets != -100
+        if sup.shape != targets.shape or sup.dtype != torch.bool:
+            raise ValueError("sup must be bool [B,N]")
+        sup = sup & (targets != -100)
+        batch, n = input_ids.shape
+        counts = sup.sum(1)
+        width = parallel.max_query_count(int(counts.max()), input_ids.device)
+        # Sort only integer positions, not the large feature tensor.
+        indices = torch.arange(n, device=input_ids.device)[None].expand(batch, -1)
+        indices = torch.where(sup, indices, n).sort(1).values
+        if width > n:
+            indices = F.pad(indices, (0, width-n), value=n)
+        indices = indices[:, :width]
+        valid = indices < n
+        safe = indices.clamp_max(n-1)
+        pos = torch.where(valid, indices + offset, -1)
+        selected_targets = targets.gather(1, safe).masked_fill(~valid, -100)
+        x, k, v = self.encode_shard(input_ids, parallel, offset)
+        rows = torch.arange(batch, device=x.device)[:, None]
+        losses, hits = [], []
+        step = self.pos_chunk or 128
+        for lo in range(0, width, step):
+            hi = min(lo+step, width)
+            z = x[rows, safe[:, lo:hi]]
+            positions = parallel.gather_positions(pos[:, lo:hi])
+            for rd in self.reads:
+                # Do NOT checkpoint collectives: all ranks must execute the
+                # same communication order even with unsupervised shards.
+                z = self._dense_round(rd, z, k, v, positions, parallel)
+            for j in range(0, hi-lo, self.loss_chunk):
+                target = selected_targets[:, lo+j:min(lo+j+self.loss_chunk, hi)]
+                def head_loss(hidden, labels):
+                    logits = self.lm_head(self.final_norm(hidden)).float()
+                    loss = F.cross_entropy(logits.flatten(0, 1), labels.flatten(),
+                                           ignore_index=-100, reduction="sum")
+                    hit = (logits.argmax(-1) == labels) | (labels == -100)
+                    return loss, hit
+                h = z[:, j:j+self.loss_chunk]
+                if self.checkpoint_chunks and torch.is_grad_enabled():
+                    loss, hit = checkpoint(head_loss, h, target, use_reentrant=False,
+                                           preserve_rng_state=False)
+                else:
+                    loss, hit = head_loss(h, target)
+                losses.append(loss)
+                hits.append(hit.detach())
+        hit = torch.cat(hits, 1)
+        return {"loss_sum": torch.stack(losses).sum(), "count": valid.sum(),
+                "correct": (hit & valid).sum(), "row_errors": ((~hit) & valid).sum(1),
+                "positions": pos, "hits": hit}
 
     def encode(self, input_ids):
         """Tokens -> (x, raw_k, raw_v). Write-once content, linear cost."""
@@ -309,7 +406,12 @@ class StackModel(nn.Module):
             torch.mps.synchronize()
         return time.perf_counter()
 
-    def forward(self, input_ids, sup=None):
+    def forward(self, input_ids, sup=None, *, targets=None, parallel=None, offset=0,
+                compact=False):
+        if targets is not None:
+            return self.forward_loss(input_ids, targets, sup, parallel, offset)
+        if input_ids.ndim != 2 or min(input_ids.shape) < 1:
+            raise ValueError("input_ids must have nonempty shape [batch, sequence]")
         batch, n = input_ids.shape
         b = self.block_size
         groups = (n + b - 1) // b
@@ -319,40 +421,52 @@ class StackModel(nn.Module):
         pos, s_n = self.supervised_positions(sup, n)
         if pos is None:
             pos = torch.arange(n, device=x.device)[None].expand(batch, n)
-        block_of = pos // b
-        valid_from = torch.where(block_of >= 1, (block_of - 1) * b,
-                                 torch.zeros_like(block_of))
         offs = torch.arange(2 * b, device=x.device)
-        src = pos[:, :, None] - (2 * b - 1) + offs           # local window
-        src_valid = (src >= valid_from[:, :, None]) & (src >= 0)
         # block-view of the raw keys for the push pass (padded tail never
         # satisfies visibility, so padding garbage is always masked)
         pad = groups * b - n
         kb = F.pad(raw_k, (0, 0, 0, 0, 0, pad)).reshape(batch, groups, b,
                                                         self.heads, self.hd)
         cover_end = (torch.arange(groups, device=x.device) + 1) * b
-        indexed_end = (block_of - 1) * b                     # blocks j <= k-2
-        visible = cover_end[None, None, :] <= indexed_end[:, :, None]
-        env = dict(n=n, b=b, groups=groups, pad=pad, pos=pos, kb=kb,
-                   visible=visible, raw_k=raw_k, raw_v=raw_v,
-                   src=src, src_valid=src_valid,
+        env = dict(n=n, b=b, groups=groups, pad=pad, kb=kb,
+                   raw_k=raw_k, raw_v=raw_v,
                    rows3=torch.arange(batch, device=x.device)[:, None, None],
                    block_ids=torch.arange(n, device=x.device) // b,
                    token_ids=torch.arange(n, device=x.device))
         dense = self.topk >= groups
-        round_fn = self._read_round_dense if dense else self._read_round_sparse
         z_rows = torch.arange(batch, device=x.device)[:, None]
         outs = []
         chunk = self._chunk_size(n)
         for start in range(0, s_n, chunk):
             sl = slice(start, min(s_n, start + chunk))
             z = x[z_rows, pos[:, sl]]
+            pc = pos[:, sl]
+            if not dense and torch.is_grad_enabled():
+                block_of = pc // b
+                valid_from = ((block_of-1) * b).clamp_min(0)
+                src = pc[:, :, None] - (2*b-1) + offs
+                env.update(pos=pc, src=src,
+                           src_valid=(src >= valid_from[:, :, None]) & (src >= 0),
+                           visible=cover_end[None, None, :] <= ((block_of-1)*b)[:, :, None])
             for rd in self.reads:
-                z = round_fn(rd, z, sl, env)
+                if dense:
+                    z = self._dense_round(rd, z, raw_k, raw_v, pc, ParallelContext())
+                elif not torch.is_grad_enabled():
+                    from .sparse import sparse_attention, TensorPages
+                    q = rd.wq(rd.q_norm(z)).reshape(batch, z.shape[1], self.heads, self.hd)
+                    ctx = sparse_attention(q, TensorPages(raw_k, raw_v,
+                                           page_tokens=max(b, 65536//b*b)),
+                                           pc, b, min(self.topk, groups), self.backend)
+                    z = z + rd.read_out(ctx.reshape(batch, z.shape[1], self.dim))
+                    z = z + rd.ffn(rd.ffn_norm(z))
+                else:
+                    z = self._read_round_sparse(rd, z, slice(None), env)
             outs.append(z)
         t2 = self._prof_tick(input_ids.device)
         z = torch.cat(outs, dim=1)
         sup_logits = self.lm_head(self.final_norm(z))
+        if compact:
+            return sup_logits
         logits = sup_logits.new_zeros(batch, n, sup_logits.shape[-1])
         logits[z_rows, pos] = sup_logits
         t3 = self._prof_tick(input_ids.device)

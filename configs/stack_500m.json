@@ -1,0 +1,21 @@
+{
+  "model": {
+    "vocab_size": 256,
+    "dim": 1536,
+    "heads": 24,
+    "block_size": 16,
+    "topk": 64,
+    "arch": "Lx16,G",
+    "ffn_ratio": 4.2
+  },
+  "runtime": {
+    "precision": "bf16",
+    "context_parallel": "auto",
+    "checkpoint_chunks": true,
+    "optimizer_shard": true,
+    "encoder_chunk": 512,
+    "query_chunk": 64,
+    "loss_chunk": 64,
+    "batch_size": 1
+  }
+}
