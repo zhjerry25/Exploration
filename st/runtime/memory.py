@@ -68,6 +68,10 @@ def plan_inference(model, batch, local_length, *, cache="auto", memory_fraction=
             cache = "cuda"
         elif host_budget is not None and total + 4*workspace < host_budget*.7:
             cache = "cpu"
+        elif host_budget is None and total + 4*workspace <= 2*GiB:
+            # Host RAM is undeterminable (e.g. macOS without psutil) and the
+            # cache is trivially small; proceed on CPU rather than refuse.
+            cache = "cpu"
         elif cache_dir:
             cache = "disk"
         else:

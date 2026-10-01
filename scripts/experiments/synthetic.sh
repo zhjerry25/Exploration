@@ -35,19 +35,22 @@ for S in 0 1 2; do
   say "S1 MQAR 128 ignition"
 
   python -m st train --task mqar --length 128 --npairs 16 --nqueries 16 \
-  --steps 3000 --batch-size 64 --lr 1e-3 --precision bf16 --seed $S --save runs/s1_mqar128_s$S.pt --eval-every 500 --eval-batches 4
+  --steps 3000 --batch-size 64 --lr 1e-3 --precision bf16 --seed $S --save runs/s1_mqar128_s$S.pt \
+  --eval-every 500 --eval-batches 4 --log runs/s1_mqar128_s$S.jsonl
 
   say "S1 MQAR 512 training"
 
   python -m st train --task mqar --length 512 --npairs 16 --nqueries 16 \
   --steps 6000 --batch-size 64 --lr 5e-4 --precision bf16 --seed $S \
-  --weights-only --resume runs/s1_mqar128_s$S.pt --save runs/s1_mqar512_s$S.pt --eval-every 500 --eval-batches 4
+  --weights-only --resume runs/s1_mqar128_s$S.pt --save runs/s1_mqar512_s$S.pt \
+  --eval-every 500 --eval-batches 4 --log runs/s1_mqar512_s$S.jsonl
 
   say "S1 MQAR zero-shot extrapolation"
 
   for N in 512 4096 65536 1000000 2000000 4000000 8000000 12000000; do
     python -m st eval --task mqar --length $N --npairs 16 --nqueries 16 \
-      --resume runs/s1_mqar512_s$S.pt --batch-size 1 --seed $S --precision fp32 --eval-batches 8
+      --resume runs/s1_mqar512_s$S.pt --batch-size 1 --seed $S --precision fp32 \
+      --eval-batches 8 --log runs/s1_mqar512_s$S.eval.jsonl
   done
 
   # ── S2 passkey ──
@@ -57,13 +60,15 @@ for S in 0 1 2; do
   say "A passkey seed=$S"
 
   python -m st train --task passkey --length 512 --steps 3000 --batch-size 64 --lr 5e-4 \
-    --precision bf16 --seed $S --save runs/s2_passkey512_s$S.pt --eval-every 500 --eval-batches 4
+    --precision bf16 --seed $S --save runs/s2_passkey512_s$S.pt \
+    --eval-every 500 --eval-batches 4 --log runs/s2_passkey512_s$S.jsonl
   
   say "S2 passkey zero-shot extrapolation"
 
   for N in 512 4096 65536 1000000 2000000 4000000 8000000 12000000; do
     python -m st eval --task passkey --length $N \
-      --resume runs/s2_passkey512_s$S.pt --batch-size 1 --seed $S --precision fp32 --eval-batches 8
+      --resume runs/s2_passkey512_s$S.pt --batch-size 1 --seed $S --precision fp32 \
+      --eval-batches 8 --log runs/s2_passkey512_s$S.eval.jsonl
   done
 done
 
