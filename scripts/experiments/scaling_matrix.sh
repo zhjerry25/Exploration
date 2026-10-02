@@ -48,3 +48,6 @@ worker 0 0 1 2 3 4 5 &
 worker 1 6 7 8 9 10 11 &
 wait
 say "scaling matrix done"
+
+# Optional automatic shutdown.
+/usr/bin/shutdown
