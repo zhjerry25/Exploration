@@ -21,6 +21,7 @@ from ..models.baseline import BaselineModel
 from ..api import build_model
 from ..config import ModelConfig, ExecutionConfig
 from ..data.tokens import TokenDataset, enwik8_dataset
+from .metrics import MetricAccumulator, parse_bucket_edges, tail_mask
 
 
 def model_options(args):
@@ -41,15 +42,24 @@ def emit(record, args, rank=0):
 
 def make_batch(args, generator, dataset=None):
     if args.task in ("tokens", "enwik8"):
-        return dataset.batch(args.batch_size, args.length, generator)
-    if args.task == "random":
+        batch = dataset.batch(args.batch_size, args.length, generator)
+    elif args.task == "random":
         seq = torch.randint(args.vocab_size, (args.batch_size, args.length+1), generator=generator)
-        return seq[:, :-1], seq[:, 1:], torch.ones(args.batch_size, args.length, dtype=torch.bool), None
-    if args.task == "mqar":
-        return data.mqar_batch(args.batch_size, args.length, generator, "cpu",
-                               n_pairs=data.resolve_npairs(args.length, args.npairs, args.npairs_density),
-                               n_queries=args.nqueries, key_tokens=args.nkeytoks)
-    return getattr(data, f"{args.task}_batch")(args.batch_size, args.length, generator, "cpu")
+        batch = (seq[:, :-1], seq[:, 1:], torch.ones(args.batch_size, args.length, dtype=torch.bool), None)
+    elif args.task == "mqar":
+        batch = data.mqar_batch(args.batch_size, args.length, generator, "cpu",
+                                n_pairs=data.resolve_npairs(args.length, args.npairs, args.npairs_density),
+                                n_queries=args.nqueries, key_tokens=args.nkeytoks)
+    else:
+        batch = getattr(data, f"{args.task}_batch")(args.batch_size, args.length, generator, "cpu")
+    ids, targets, mask, extra = batch
+    if args.supervision == "all":
+        mask = torch.ones_like(mask)
+    elif args.supervision == "tail":
+        if args.tail_tokens < 1:
+            raise ValueError("--tail-tokens must be positive with --supervision tail")
+        mask = tail_mask(mask, min(args.tail_tokens, mask.shape[1]))
+    return ids, targets, mask, extra
 
 
 def choose_cp(args, model, world, capacity):
@@ -75,13 +85,38 @@ def train(args, model, parallel, ck, dataset, validation_dataset=None):
     wrapped = DDP(model, device_ids=[device.index] if device.type == "cuda" else None,
                   broadcast_buffers=False, gradient_as_bucket_view=True,
                   find_unused_parameters=isinstance(model, StackModel) and not bool(model.reads)) if parallel.world_size > 1 else model
-    opt_kw = dict(lr=args.lr, betas=(.9, .95), weight_decay=args.weight_decay,
-                  foreach=False)
+    opt_kw = dict(lr=args.lr, betas=(.9, .95), weight_decay=args.weight_decay)
+    # Fused AdamW removes Python launches on CUDA.  ZeRO keeps foreach mode to
+    # avoid the extra fused optimizer workspace; CPU remains the portable
+    # reference path.  Older torch builds simply fall back to foreach AdamW.
+    if device.type == "cuda":
+        if args.optimizer_shard and parallel.world_size > 1:
+            opt_kw["foreach"] = True
+        else:
+            try:
+                if "fused" in torch.optim.AdamW.__init__.__code__.co_varnames:
+                    opt_kw["fused"] = True
+                else:
+                    opt_kw["foreach"] = True
+            except AttributeError:
+                opt_kw["foreach"] = True
+    else:
+        opt_kw["foreach"] = False
     if args.optimizer_shard and parallel.world_size > 1:
         from torch.distributed.optim import ZeroRedundancyOptimizer
-        opt = ZeroRedundancyOptimizer(model.parameters(), optimizer_class=torch.optim.AdamW, **opt_kw)
+        try:
+            opt = ZeroRedundancyOptimizer(model.parameters(), optimizer_class=torch.optim.AdamW, **opt_kw)
+        except (TypeError, RuntimeError):
+            opt_kw.pop("fused", None)
+            opt_kw["foreach"] = device.type == "cuda"
+            opt = ZeroRedundancyOptimizer(model.parameters(), optimizer_class=torch.optim.AdamW, **opt_kw)
     else:
-        opt = torch.optim.AdamW(model.parameters(), **opt_kw)
+        try:
+            opt = torch.optim.AdamW(model.parameters(), **opt_kw)
+        except (TypeError, RuntimeError):
+            opt_kw.pop("fused", None)
+            opt_kw["foreach"] = device.type == "cuda"
+            opt = torch.optim.AdamW(model.parameters(), **opt_kw)
     generator = torch.Generator().manual_seed(args.seed+100+parallel.dp_rank)
     start = 0
     if ck is not None and not args.weights_only:
@@ -90,7 +125,8 @@ def train(args, model, parallel, ck, dataset, validation_dataset=None):
             raise ValueError("exact resume requires the saved topology; use --weights-only for a new topology")
         old_runtime = ck.get("config", {}).get("runtime", {})
         for key in ("task", "tokens", "token_dtype", "length", "batch_size", "grad_accum",
-                    "precision", "steps", "lr", "weight_decay", "clip_grad", "npairs", "npairs_density", "nqueries", "nkeytoks"):
+                    "precision", "steps", "lr", "weight_decay", "clip_grad", "npairs", "npairs_density", "nqueries", "nkeytoks",
+                    "supervision", "tail_tokens"):
             if key in old_runtime and getattr(args, key) != old_runtime[key]:
                 raise ValueError(f"exact resume requires {key}={old_runtime[key]!r}; use --weights-only to change the experiment")
         opt.load_state_dict(ck["opt"])
@@ -179,7 +215,10 @@ def evaluate(args, model, parallel, dataset, during_training=False, step=None):
         model.to(torch.bfloat16)
     group = dist.group.WORLD if parallel.world_size > 1 else None
     generator = torch.Generator().manual_seed(args.seed+200)
-    loss_sum = count = correct = exact = rows_total = 0
+    bucket_edges = parse_bucket_edges(getattr(args, "metric_buckets", "auto"), args.length)
+    metrics = MetricAccumulator(bucket_edges)
+    metrics.start_rows(0, track_rows=False)
+    exact = rows_total = 0
     begin = time.perf_counter()
     if next(model.parameters()).is_cuda and not during_training:
         torch.cuda.reset_peak_memory_stats()
@@ -211,20 +250,20 @@ def evaluate(args, model, parallel, dataset, during_training=False, step=None):
                 iterator = session.iter_logits()
             else:
                 device = next(model.parameters()).device
-                iterator = model.iter_logits(ids.to(device), positions.to(device))
+                iterator = model.iter_logits(ids.to(device), positions.to(device),
+                                              parallel=parallel)
             for sl, logits, _ in iterator:
                 target = truth[:, sl].to(logits.device)
-                loss_sum += float(torch.nn.functional.cross_entropy(logits.float().flatten(0, 1), target.flatten(), reduction="sum"))
                 hit = logits.argmax(-1).eq(target)
-                count += target.numel()
-                correct += int(hit.sum())
                 errors += (~hit).sum(1).cpu()
+                metrics.update(logits, target, positions[:, sl].to(logits.device))
         exact += int((errors == 0).sum())
         rows_total += args.batch_size
+    summary = metrics.finalize()
+    summary["exact"] = exact / max(1, rows_total)
     result = {"event": "eval", **({"step": step} if step is not None else {}),
-              "length": args.length, "loss": round(loss_sum/count, 6),
-              "bpc": round(loss_sum/count/math.log(2), 6), "accuracy": round(correct/count, 4),
-              "exact": round(exact/rows_total, 4), "evaluated_tokens": count,
+              "length": args.length, **{key: round(value, 6) if isinstance(value, float) else value
+                                        for key, value in summary.items()},
               "seconds": round(time.perf_counter()-begin, 3),
               "peak_allocated_gib": round(torch.cuda.max_memory_allocated()/GiB, 3) if next(model.parameters()).is_cuda else None}
     emit(result, args, parallel.rank)
@@ -248,8 +287,16 @@ def run(args):
         setattr(args, key, value)
     args.topk = options.get("topk", 64)
     model = build_model(options, device="meta" if args.command == "plan" else "cpu",
-                        execution=ExecutionConfig(args.backend, args.checkpoint_chunks,
-                                                  args.encoder_chunk, args.query_chunk, args.loss_chunk))
+                        execution=ExecutionConfig(
+                            backend=args.backend,
+                            checkpoint_chunks=args.checkpoint_chunks,
+                            encoder_chunk=args.encoder_chunk,
+                            query_chunk=args.query_chunk,
+                            loss_chunk=args.loss_chunk,
+                            flash_attention=args.flash_attention,
+                            attention_q_chunk=args.attention_q_chunk,
+                            attention_kv_chunk=args.attention_kv_chunk,
+                        ))
     if ck is not None:
         if args.command != "plan":
             model.load_state_dict(ck["model"], strict=True)

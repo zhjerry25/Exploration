@@ -14,7 +14,7 @@
     "checkpoint_chunks": true,
     "optimizer_shard": true,
     "encoder_chunk": 1024,
-    "query_chunk": 128,
+    "query_chunk": 0,
     "loss_chunk": 128
   }
 }

@@ -19,6 +19,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from ..ops.attention import dense_attention
+from ..ops.flash import backend_info
 from ..models.baseline import BaselineModel
 from ..runtime.inference import InferenceSession
 from ..runtime.parallel import ParallelContext, sum_all
@@ -39,6 +40,7 @@ def environment():
         record["triton"] = triton.__version__
     except ImportError:
         record["triton"] = None
+    record["sdpa"] = backend_info("cuda" if torch.cuda.is_available() else "cpu")
     return record
 
 

@@ -40,14 +40,30 @@ class ExecutionConfig:
     backend: str = "auto"
     checkpoint_chunks: bool = True
     encoder_chunk: int = 1024
-    query_chunk: int = 128
+    # 0 lets StackModel choose a memory-bounded query tile from the model and
+    # sequence length.  Baseline does not use this field for its encoder.
+    query_chunk: int = 0
     loss_chunk: int = 128
+    # Native SDPA mode used by the fair dense baseline.  ``auto`` lets
+    # PyTorch select FlashAttention/memory-efficient/math per device.
+    flash_attention: str = "auto"
+    # Reference attention tile sizes.  Triton kernels choose their own launch
+    # tile; these bound the portable torch implementation on long contexts.
+    attention_q_chunk: int = 128
+    attention_kv_chunk: int = 4096
 
     def __post_init__(self):
         if self.backend not in ("auto", "torch", "triton"):
             raise ValueError("backend must be auto, torch or triton")
-        if min(self.encoder_chunk, self.query_chunk, self.loss_chunk) < 1:
+        if self.flash_attention not in ("auto", "flash", "math"):
+            raise ValueError("flash_attention must be auto, flash or math")
+        values = (self.encoder_chunk, self.loss_chunk,
+                  self.attention_q_chunk, self.attention_kv_chunk)
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 1
+               for value in values):
             raise ValueError("execution chunk sizes must be positive")
+        if isinstance(self.query_chunk, bool) or not isinstance(self.query_chunk, int) or self.query_chunk < 0:
+            raise ValueError("query_chunk must be non-negative (0 = auto)")
 
     def to_dict(self):
         return asdict(self)

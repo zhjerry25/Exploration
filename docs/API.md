@@ -8,6 +8,7 @@ from st import (
     ModelConfig, ExecutionConfig,
     build_model, load_model,
     InferenceSession, ParallelContext, TokenDataset,
+    MetricAccumulator, tail_mask,
 )
 ```
 
@@ -24,6 +25,8 @@ config = ModelConfig(
 execution = ExecutionConfig(
     backend="auto", checkpoint_chunks=True,
     encoder_chunk=1024, query_chunk=128, loss_chunk=128,
+    flash_attention="auto", attention_q_chunk=128,
+    attention_kv_chunk=4096,
 )
 model = build_model(config, execution=execution, device="cuda")
 
@@ -40,7 +43,10 @@ loaded = load_model(
 
 `build_model` 返回原生 `torch.nn.Module`，参数保持标准 `state_dict` 格式。embedding 与 lm_head 的权重共享、`(L)xN/(G)xN` 的共享权重保持不变。`ExecutionConfig` 仅控制执行，不改变架构参数。`load_model` 只恢复权重；完整训练续训使用统一 CLI。
 
-baseline 使用 `ModelConfig(model="baseline", layers=3, ...)`，同样接受执行配置。其 attention 始终 dense，不能使用 `InferenceSession` 的 sparse raw-KV 缓存。
+baseline 使用 `ModelConfig(model="baseline", layers=3, ...)`，同样接受执行配置。其
+attention 通过 PyTorch SDPA 自动选择 FlashAttention/memory-efficient kernel；
+`flash_attention="flash"` 可在验收时强制 fused kernel，`"math"` 仅用于数值对照。
+它不能使用 `InferenceSession` 的 sparse raw-KV 缓存。
 
 ## 训练：直接传入自己的 batch
 
@@ -72,6 +78,11 @@ optimizer.step()
 | `row_errors` | 每行错误 token 数，可用于跨 CP 归并 exact accuracy |
 
 StackModel 还返回 packed `positions`/`hits`；它们不是 baseline 的共同接口。分块 CE 不返回完整 `[B,N,V]` logits。调用方负责对 loss 做期望的归一化。
+
+统一评测可用 `MetricAccumulator` 流式累加 query chunks，结果同时包含 `loss`、`bpc`、
+`ppl`、token `accuracy`、row-level `exact` 和按绝对位置划分的 `buckets`。CLI 的
+`--supervision tail --tail-tokens K` 为训练与评测提供尾部监督；`--metric-buckets
+0,1024,4096,...` 自定义桶边界，默认自动生成四个等宽桶。
 
 原始小规模接口仍可用：`model(ids, sup=mask)` 返回 `[B,N,V]`，非监督位置为零；`compact=True` 返回等长监督位置的 `[B,S,V]`。此接口保留完整编码状态和 logits，适合 reference/小规模研究。长上下文使用下面的 session API。
 

@@ -1,5 +1,6 @@
 """Causal and interface checks for the dense transformer baseline."""
 import unittest
+import copy
 
 import torch
 
@@ -52,6 +53,26 @@ class BaselineModelTests(unittest.TestCase):
         for p in m.parameters():
             if p.grad is not None:
                 self.assertTrue(torch.isfinite(p.grad).all())
+
+    def test_full_block_checkpoint_matches_reference(self):
+        torch.manual_seed(9)
+        reference = model(backend="math").double()
+        checkpointed = copy.deepcopy(reference)
+        checkpointed.checkpoint_chunks = True
+        for block in checkpointed.blocks:
+            block.attention_backend = "math"
+        ids = torch.randint(31, (2, 13))
+        targets = torch.randint(31, ids.shape)
+        sup = torch.zeros_like(ids, dtype=torch.bool)
+        sup[:, -4:] = True
+        expected = reference(ids, targets=targets, sup=sup)["loss_sum"]
+        actual = checkpointed(ids, targets=targets, sup=sup)["loss_sum"]
+        torch.testing.assert_close(actual, expected, atol=1.e-10, rtol=1.e-10)
+        expected.backward()
+        actual.backward()
+        for left, right in zip(reference.parameters(), checkpointed.parameters()):
+            if left.grad is not None:
+                torch.testing.assert_close(left.grad, right.grad, atol=1.e-9, rtol=1.e-8)
 
     def test_param_count_matches_stack_within_tolerance(self):
         # the E1 pairing: baseline --layers 3 vs stack "Lx2,G"

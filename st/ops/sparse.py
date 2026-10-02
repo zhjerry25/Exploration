@@ -96,7 +96,7 @@ class TensorPages:
         return (local//self.page_tokens).unique().cpu().tolist()
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def sparse_attention(q, cache, positions, block_size, topk, backend="auto", group=None,
                      score_page_tokens=65536, return_selection=False):
     """Exact score/top-k + gate + sparse pop; optional sequence-shard group.

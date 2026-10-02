@@ -13,6 +13,11 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
+try:
+    from torch.nn.attention.bias import causal_lower_right as _causal_lower_right
+except (ImportError, AttributeError):
+    _causal_lower_right = None
+
 
 FOLD_CHUNK = 8192
 
@@ -34,13 +39,38 @@ def _attention(q, k, v, mask):
     q = q.permute(0, 1, 3, 2, 4).reshape(batch * groups, heads, length, hd)
     k = k.permute(0, 1, 3, 2, 4).reshape(batch * groups, heads, -1, hd)
     v = v.permute(0, 1, 3, 2, 4).reshape(batch * groups, heads, -1, hd)
-    mask = mask.expand(batch, groups, length, k.shape[2]).reshape(
-        batch * groups, 1, length, k.shape[2]
-    )
-    parts = [F.scaled_dot_product_attention(qi, ki, vi, attn_mask=mi)
-             for qi, ki, vi, mi in zip(q.split(FOLD_CHUNK), k.split(FOLD_CHUNK),
-                                      v.split(FOLD_CHUNK), mask.split(FOLD_CHUNK))]
-    return torch.cat(parts, dim=0).transpose(1, 2).reshape(batch, groups, length, heads, hd)
+    mask = mask.expand(batch, groups, length, k.shape[2])
+    # Full interior windows have exactly a lower-right causal pattern.  The
+    # CausalBias object lets PyTorch dispatch those rows to FlashAttention
+    # without materialising a [groups, T, 2T] boolean mask.  First/last
+    # windows can still contain halo/padding exceptions and use the portable
+    # masked SDPA path below.
+    fast = None
+    if _causal_lower_right is not None and length <= k.shape[2]:
+        causal = torch.ones((length, k.shape[2]), device=q.device, dtype=torch.bool).tril(
+            diagonal=k.shape[2] - length)
+        fast = mask.eq(causal).all((-1, -2)).reshape(-1)
+    flat_q = q.reshape(batch * groups, heads, length, hd)
+    flat_k = k.reshape(batch * groups, heads, -1, hd)
+    flat_v = v.reshape(batch * groups, heads, -1, hd)
+    result = torch.empty_like(flat_q)
+    if fast is not None and bool(fast.any()):
+        qi, ki, vi = flat_q[fast], flat_k[fast], flat_v[fast]
+        bias = _causal_lower_right(length, k.shape[2])
+        result[fast] = torch.cat([
+            F.scaled_dot_product_attention(qc, kc, vc, attn_mask=bias)
+            for qc, kc, vc in zip(qi.split(FOLD_CHUNK), ki.split(FOLD_CHUNK),
+                                  vi.split(FOLD_CHUNK))], dim=0)
+    slow = ~fast if fast is not None else torch.ones(flat_q.shape[0], dtype=torch.bool, device=q.device)
+    if bool(slow.any()):
+        slow_mask = mask.reshape(batch * groups, 1, length, k.shape[2])[slow]
+        result[slow] = torch.cat([
+            F.scaled_dot_product_attention(qc, kc, vc, attn_mask=mc)
+            for qc, kc, vc, mc in zip(flat_q[slow].split(FOLD_CHUNK),
+                                      flat_k[slow].split(FOLD_CHUNK),
+                                      flat_v[slow].split(FOLD_CHUNK),
+                                      slow_mask.split(FOLD_CHUNK))], dim=0)
+    return result.transpose(1, 2).reshape(batch, groups, length, heads, hd)
 
 
 class RotaryEmbedding(nn.Module):

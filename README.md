@@ -1,16 +1,19 @@
 # Stack experiments
 
 Dense 训练、sparse 推理的实验框架。**所有命令都从 `python -m st` 开始。**
+Baseline Transformer 使用 PyTorch 原生 SDPA 自动选择 FlashAttention；Stack 保持精确
+gated dense 训练和分页 sparse 推理。评测统一输出 loss/bpc/ppl/accuracy/exact，并可按
+绝对位置分桶或只监督尾部 query。
 在仓库根目录运行；不需要知道内部 Python 文件的位置。
 
-| 想做什么 | 命令 |
-|---|---|
-| 看有哪些命令 | `python -m st --help` |
-| 看模型大小和显存估算 | `python -m st plan --config configs/stack_2m.json` |
-| 训练 | `python -m st train --help` |
-| 加载 checkpoint 评测 | `python -m st eval --help` |
-| 验证正确性 | `python -m st validate --help` |
-| 测 attention 速度和显存 | `python -m st benchmark --help` |
+| 想做什么                | 命令                                                 |
+| ----------------------- | ---------------------------------------------------- |
+| 看有哪些命令            | `python -m st --help`                              |
+| 看模型大小和显存估算    | `python -m st plan --config configs/stack_2m.json` |
+| 训练                    | `python -m st train --help`                        |
+| 加载 checkpoint 评测    | `python -m st eval --help`                         |
+| 验证正确性              | `python -m st validate --help`                     |
+| 测 attention 速度和显存 | `python -m st benchmark --help`                    |
 
 ## 环境
 
@@ -74,15 +77,19 @@ python -m st benchmark --operation dense --length 385 --queries 5 \
 torchrun --standalone --nproc_per_node=2 -m st train \
   --config configs/stack_2m.json --task random --length 8192 \
   --context-parallel 2 --batch-size 1 --steps 20 --log-every 5 --save '' \
-  --log runs/benchmarks/train-cp2.jsonl
+  > runs/benchmarks/train-cp2.jsonl 2>&1
 ```
+
+The shell redirection keeps `--log` from being interpreted as a `torchrun`
+`--log-dir` abbreviation on PyTorch versions that parse launcher options after
+`-m st`.
 
 `random` 只测工程性能，不证明任务质量；算子毫秒数也不代表完整训练吞吐。
 
 ## 目录
 
 ```text
-configs/              2M / 100M / 500M 模型预设
+configs/              Stack 2M / 100M / 500M 与公平 baseline 2M 预设
 st/
   api.py, config.py   外部接口：build_model / load_model / 配置
   cli.py              统一命令路由
@@ -100,11 +107,8 @@ data/, runs/          本地语料与输出，不纳入版本控制
 - [完整命令、并行训练、数据与续训](docs/COMMANDS.md)
 - [公共 Python API](docs/API.md)
 - [算法、并行与资源设计](docs/ARCHITECTURE.md)
+- [Camera-ready 优化记录与验收](docs/research/Optimization.md)
 - [已验证结果与尚待验收的项目](docs/VALIDATION.md)
 
 `from st import StackModel, build_model, load_model, InferenceSession` 等公共接口保持不变。
 旧 checkpoint 仍可加载，旧 Python 模块导入通过别名转到唯一实现。
-
-目前收到的 CUDA v2 回报仍在 FP32 D=128/B=128 处失败。当前修订已加入完整 block
-跨小 tile 归约的 Triton 路径，**尚待远程验证**；不能据此宣称全部 GPU、65k 训练和
-16M/32M 外推已通过，也没有已验证的整体加速倍数。

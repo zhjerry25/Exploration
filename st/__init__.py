@@ -9,19 +9,22 @@ from .runtime.inference import InferenceSession
 from .runtime.parallel import ParallelContext
 from .models.stack import StackModel
 from .data.tokens import TokenDataset
+from .ops.flash import flash_attention, backend_info
+from .runtime.metrics import MetricAccumulator, parse_bucket_edges, tail_mask
 
 __version__ = "0.2.0"
 __all__ = ["StackModel", "BaselineModel", "ModelConfig", "ExecutionConfig",
-           "build_model", "load_model", "InferenceSession", "ParallelContext", "TokenDataset"]
+           "build_model", "load_model", "InferenceSession", "ParallelContext", "TokenDataset",
+           "flash_attention", "backend_info", "MetricAccumulator", "parse_bucket_edges", "tail_mask"]
 
 # Import aliases preserve previous Python integrations without duplicate files
 # or implementations. CLI entry points are exclusively routed by st.cli.
 import sys as _sys
 from .models import blocks, stack as stack_model, baseline
-from .ops import attention, sparse
+from .ops import attention, sparse, flash
 from .runtime import checkpoint, inference, parallel, memory
 from .data import tokens as token_data
-for _name in ("blocks", "stack_model", "baseline", "attention", "sparse",
+for _name in ("blocks", "stack_model", "baseline", "attention", "sparse", "flash",
               "checkpoint", "inference", "parallel", "memory", "token_data"):
     _sys.modules[f"{__name__}.{_name}"] = globals()[_name]
 del _sys, _name

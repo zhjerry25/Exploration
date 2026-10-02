@@ -10,7 +10,7 @@ mkdir -p "$REPORT_DIR"
 torchrun --standalone --nproc_per_node="$GPUS" -m st train \
   --config configs/stack_2m.json --task random --length 512 --steps 4 \
   --grad-accum 2 --save-every 2 --save "$REPORT_DIR/model.pt" \
-  --log-every 1 --log "$REPORT_DIR/train.jsonl" 2>&1 | tee "$REPORT_DIR/train.log"
+  --log-every 1 2>&1 | tee "$REPORT_DIR/train.log"
 
 python -m st eval --resume "$REPORT_DIR/model.pt" --task random \
   --length 2048 --eval-positions 16 --cache cpu --output "$REPORT_DIR/eval.json" \

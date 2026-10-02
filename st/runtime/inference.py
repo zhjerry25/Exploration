@@ -90,7 +90,7 @@ class InferenceSession:
         self.query_directory = None
         self.ready = False
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def prefill(self, input_ids, positions):
         if self.cache is not None or self.ready:
             raise RuntimeError("use a new session for each prompt")
@@ -141,7 +141,13 @@ class InferenceSession:
                 # Newly allocated files read as zero; unowned query rows
                 # must remain zero before cross-rank reduction.
             else:
-                self.query_states = torch.zeros(batch, positions.shape[1], self.model.dim, dtype=self.dtype, device="cpu")
+                # Keep query states beside the KV cache when it fits on GPU.
+                # CPU/disk tiers retain the bounded transfer behavior used by
+                # long-context paging; CUDA tier avoids a PCIe round-trip for
+                # every query chunk during the read phase.
+                query_device = self.device if self.plan.cache == "cuda" else "cpu"
+                self.query_states = torch.zeros(batch, positions.shape[1], self.model.dim,
+                                                dtype=self.dtype, device=query_device)
             for lo in range(warm, end, self.plan.encoder_chunk):
                 hi = min(end, lo+self.plan.encoder_chunk)
                 x = self.model.embedding(input_ids[:, lo:hi].to(self.device))
@@ -158,7 +164,12 @@ class InferenceSession:
                         if right > left:
                             cols = sorted_index[row, left:right]
                             gathered = x[row, (positions[row, cols]-lo).to(self.device)]
-                            self.query_states[row, cols] = gathered.cpu()
+                            if self.query_states.device.type == "cpu":
+                                gathered = gathered.cpu()
+                                query_cols = cols
+                            else:
+                                query_cols = cols.to(self.query_states.device)
+                            self.query_states[row, query_cols] = gathered
                 del x, k, v
             self.ready = True
         except BaseException:
@@ -166,14 +177,14 @@ class InferenceSession:
             raise
         return self
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def iter_logits(self, return_selection=False):
         if not self.ready:
             raise RuntimeError("prefill must complete before inference")
         m = self.model
         for lo in range(0, self.positions.shape[1], self.plan.query_chunk):
             hi = min(lo+self.plan.query_chunk, self.positions.shape[1])
-            z = self.query_states[:, lo:hi].to(self.device)
+            z = self.query_states[:, lo:hi].to(self.device, non_blocking=True)
             if self.world > 1:
                 dist.all_reduce(z, group=self.group)
             pos = self.positions[:, lo:hi].to(self.device)

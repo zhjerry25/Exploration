@@ -27,11 +27,15 @@ JSON 的根节点只有 `model` 和 `runtime`，键名用下划线，例如 `bat
 | `--grad-accum` | 累积 microbatch 数 |
 | `--precision bf16 / fp32` | 训练 bf16 autocast / fp32；独立推理使用相应权重与缓存 dtype |
 | `--backend auto / triton / torch` | auto 对不支持的布局用 bounded torch 路径；Triton 资源不足时切换小 tile Triton，编译/数值错误不会被吞掉 |
+| `--flash-attention auto / flash / math` | baseline 的原生 SDPA 选择；auto 跨 CUDA/CPU，flash 用于强制 FlashAttention 验收 |
 | `--context-parallel auto / N` | N 必须整除进程数和 heads；auto 是启发式规划，不是性能调优结果 |
 | `--[no-]checkpoint-chunks` | 局部计算和 vocabulary head 的激活重计算 |
 | `--[no-]optimizer-shard` | 多卡 ZeRO-1；默认启用 |
 | `--activation-offload` | 将 autograd 保存张量移到 pinned host memory，消耗 RAM/PCIe 带宽 |
 | `--encoder-chunk`, `--query-chunk`, `--loss-chunk` | 编码 token、每 rank 训练 query、loss head 的分块大小 |
+| `--attention-q-chunk`, `--attention-kv-chunk` | Stack torch reference 的 exact-gate tile；Triton 自动选择资源兼容 tile |
+| `--supervision task / all / tail`, `--tail-tokens` | 任务 mask、全位置或尾部监督；尾部模式要求正的 token 数 |
+| `--metric-buckets` | 绝对位置桶边界，如 `0,1024,4096,65536`；输出附带每桶 bpc/ppl/accuracy |
 | `--memory-fraction` | 显存预算比例；默认 .8 |
 | `--allow-over-budget` | 明确越过保守训练估算；不会保证实际运行不 OOM |
 
@@ -55,7 +59,10 @@ torchrun --standalone --nproc_per_node=8 -m st train \
   --steps 1000 --save runs/lm.pt
 ```
 
-增大词表会改变参数量；先执行同参数的 `plan`。baseline 使用同一训练引擎及 CP all-to-all，但其全局层始终是普通 dense causal attention，不存在 sparse 推理或 raw-KV 分页加速。baseline 独立评测应使用单进程；多进程目前会重复评测同一数据，不提供推理加速。
+增大词表会改变参数量；先执行同参数的 `plan`。baseline 使用同一训练引擎及 CP all-to-all，
+每层通过 mask-free SDPA 进入 FlashAttention/memory-efficient kernel；它始终是普通 dense
+causal attention，不存在 sparse 推理或 raw-KV 分页加速。baseline 独立评测应使用单进程；
+多进程目前会重复评测同一数据，不提供推理加速。
 
 ## 数据
 
@@ -168,8 +175,11 @@ python -m st benchmark --length 385 --queries 5 --head-dim 128 \
 torchrun --standalone --nproc_per_node=2 -m st train \
   --config configs/stack_2m.json --task random --length 8192 \
   --context-parallel 2 --batch-size 1 --steps 20 --log-every 5 --save '' \
-  --log runs/benchmarks/train-cp2.jsonl
+  > runs/benchmarks/train-cp2.jsonl 2>&1
 ```
+
+The redirection avoids a `torchrun` option-prefix collision with the training
+driver's `--log` flag on recent PyTorch releases.
 
 看 JSONL 的 `tokens_per_second`、`peak_allocated_gib`。首次编译会影响首个窗口，
 比较后续稳定窗口。比较 DP/CP 时固定全局有效 batch。该命令不评估学习质量。

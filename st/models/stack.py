@@ -129,7 +129,8 @@ class StackModel(nn.Module):
 
     def __init__(self, vocab_size, dim=256, heads=4, block_size=16, topk=64,
                  arch="Lx2,G", ffn_ratio=4, pos_chunk=0, backend="auto",
-                 checkpoint_chunks=False, encoder_chunk=1024, loss_chunk=128):
+                 checkpoint_chunks=False, encoder_chunk=1024, loss_chunk=128,
+                 attention_q_chunk=128, attention_kv_chunk=4096):
         super().__init__()
         integers = {"vocab_size": vocab_size, "dim": dim, "heads": heads,
                     "block_size": block_size, "topk": topk}
@@ -150,10 +151,15 @@ class StackModel(nn.Module):
         self.arch = arch
         if backend not in ("auto", "torch", "triton"):
             raise ValueError("backend must be auto, torch, or triton")
-        if encoder_chunk < block_size or loss_chunk < 1:
-            raise ValueError("encoder_chunk >= block_size and loss_chunk > 0 required")
+        chunks = {"encoder_chunk": encoder_chunk, "loss_chunk": loss_chunk,
+                  "attention_q_chunk": attention_q_chunk,
+                  "attention_kv_chunk": attention_kv_chunk}
+        if any(isinstance(value, bool) or not isinstance(value, Integral) or value < 1
+               for value in chunks.values()) or encoder_chunk < block_size:
+            raise ValueError("encoder_chunk >= block_size and attention/loss chunks > 0 required")
         self.backend, self.checkpoint_chunks = backend, checkpoint_chunks
         self.loss_chunk = loss_chunk
+        self.attention_q_chunk, self.attention_kv_chunk = attention_q_chunk, attention_kv_chunk
         self.embedding = nn.Embedding(vocab_size, dim)
         nn.init.normal_(self.embedding.weight, std=0.02)
         self.rope = RotaryEmbedding(self.hd)
@@ -199,7 +205,9 @@ class StackModel(nn.Module):
         q = (checkpoint(project, z, use_reentrant=False, preserve_rng_state=False)
              if use_ckpt else project(z)).reshape(*z.shape[:2], self.heads, self.hd)
         q = parallel.to_heads(q)
-        ctx = dense_attention(q, k, v, positions, self.block_size, self.backend)
+        ctx = dense_attention(q, k, v, positions, self.block_size, self.backend,
+                              q_chunk=self.attention_q_chunk,
+                              kv_chunk=self.attention_kv_chunk)
         ctx = parallel.to_sequence(ctx).reshape(*z.shape[:2], self.dim)
         return (checkpoint(finish, z, ctx, use_reentrant=False, preserve_rng_state=False)
                 if use_ckpt else finish(z, ctx))
@@ -237,7 +245,10 @@ class StackModel(nn.Module):
         x, k, v = self.encode_shard(input_ids, parallel, offset)
         rows = torch.arange(batch, device=x.device)[:, None]
         losses, hits = [], []
-        step = self.pos_chunk or 128
+        # The automatic tile uses the same bounded-memory estimate as the
+        # compact/reference path.  A fixed small default creates one Triton
+        # autograd call per query tile and becomes CPU-dispatch bound.
+        step = self.pos_chunk or self._chunk_size(n)
         for lo in range(0, width, step):
             hi = min(lo+step, width)
             z = x[rows, safe[:, lo:hi]]
@@ -311,7 +322,13 @@ class StackModel(nn.Module):
         groups = (n + self.block_size - 1) // self.block_size
         m = min(self.topk, groups)
         elems_per_pos = self.heads * (n + 2 * m * self.block_size * self.hd)
-        return min(512, max(16, (1 << 29) // max(elems_per_pos, 1)))
+        # Small-width models are launch/scheduling bound long before they are
+        # memory bound. Let them amortize the fused gated-attention call over
+        # larger query tiles; retain the conservative cap for 100M/500M
+        # configurations where the same tile would consume substantial memory.
+        cap = 2048 if self.dim <= 512 else 512
+        budget = (1 << 31) if self.dim <= 512 else (1 << 29)
+        return min(cap, max(16, budget // max(elems_per_pos, 1)))
 
     def _read_round_sparse(self, rd, z, sl, env):
         """One G round, exact top-m plumbing (general case). The local-window

@@ -201,7 +201,11 @@ class _Dense(torch.autograd.Function):
         rc = torch.empty(q.shape, device=q.device, dtype=torch.float32)
         pr = torch.empty(q.shape[:3], device=q.device, dtype=torch.float32)
         zr, z = torch.empty_like(pr), torch.empty_like(pr)
-        tile_n, tile_m = max(64, block_size), 16
+        tile_n = max(64, block_size)
+        # Small head dimensions leave enough registers/shared memory for a
+        # wider query tile.  This halves the gated-kernel program count for
+        # the 2M/100M presets; larger models keep the conservative tile.
+        tile_m = 32 if dim <= 128 else 16
         meta = dict(SQ=queries, SK=k.shape[1], H=heads, D=dim, B=block_size,
                     DM=max(16, tr.next_power_of_2(dim)), M=tile_m, N=tile_n,
                     SCALE=dim ** -0.5)

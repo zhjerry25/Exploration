@@ -42,6 +42,13 @@ dummy queries、尾部与端到端 bf16。新测试代码不等于通过记录�
 
 ## 后续验收矩阵
 
+当前代码还增加了以下本地可重复检查：
+
+- `MetricAccumulator` 的流式 loss/bpc/ppl、exact 与位置桶边界。
+- Baseline 的 `math` SDPA 与整层 checkpoint 前后向梯度一致性。
+- `--supervision tail --tail-tokens K` 与 `--metric-buckets` 的统一 CLI 路径。
+- CUDA KV tier 下 query state 驻留 GPU 的分页推理路径（需远端 CUDA 才能覆盖）。
+
 ```bash
 GPUS=2 bash scripts/remote_validate.sh
 GPUS=2 bash scripts/remote_smoke.sh

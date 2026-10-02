@@ -15,11 +15,11 @@ COMMANDS = {
 
 def _experiment_options(p, command):
     model = {"model", "layers", "vocab_size", "dim", "heads", "block_size", "arch", "ffn_ratio", "topk"}
-    data = {"task", "tokens", "token_dtype", "validation_tokens", "split", "length", "batch_size", "npairs", "npairs_density", "nqueries", "nkeytoks", "seed"}
+    data = {"task", "tokens", "token_dtype", "validation_tokens", "split", "length", "batch_size", "npairs", "npairs_density", "nqueries", "nkeytoks", "seed", "supervision", "tail_tokens"}
     train = {"grad_accum", "steps", "eval_every", "stop_exact", "lr", "weight_decay", "clip_grad", "log_every", "save_every", "save", "weights_only", "optimizer_shard", "activation_offload", "allow_over_budget", "context_parallel"}
-    evaluation = {"eval_batches", "eval_positions", "cache", "cache_dir", "page_tokens", "inference_query_chunk", "workspace_mb", "max_query_states_mb"}
+    evaluation = {"eval_batches", "eval_positions", "cache", "cache_dir", "page_tokens", "inference_query_chunk", "workspace_mb", "max_query_states_mb", "metric_buckets"}
     groups = {name: p.add_argument_group(name) for name in ("model", "data", "execution", "training", "evaluation", "files")}
-    plan_fields = model | {"config", "task", "length", "batch_size", "precision", "checkpoint_chunks", "resume", "encoder_chunk", "query_chunk", "loss_chunk", "backend"}
+    plan_fields = model | {"config", "task", "length", "batch_size", "precision", "checkpoint_chunks", "resume", "encoder_chunk", "query_chunk", "loss_chunk", "backend", "flash_attention", "attention_q_chunk", "attention_kv_chunk"}
 
     def add(flag, **options):
         dest = flag[2:].replace("-", "_")
@@ -52,12 +52,19 @@ def _experiment_options(p, command):
     add("--context-parallel", default="auto", help="auto or a divisor of heads and WORLD_SIZE")
     add("--precision", choices=["fp32", "bf16"], default="bf16")
     add("--backend", choices=["auto", "torch", "triton"], default="auto")
+    add("--flash-attention", dest="flash_attention", choices=["auto", "flash", "math"],
+        default="auto", help="baseline SDPA kernel: auto, explicit FlashAttention, or math")
     add("--checkpoint-chunks", action=argparse.BooleanOptionalAction, default=True)
     add("--activation-offload", action="store_true", help="offload autograd saved tensors to pinned host RAM")
     add("--optimizer-shard", action=argparse.BooleanOptionalAction, default=True)
     add("--encoder-chunk", type=int, default=1024)
-    add("--query-chunk", type=int, default=128, help="local training queries per chunk")
+    add("--query-chunk", type=int, default=0,
+        help="local training queries per chunk; 0=automatic memory-bounded tile")
     add("--loss-chunk", type=int, default=128)
+    add("--attention-q-chunk", type=int, default=128,
+        help="portable exact-attention query tile; Triton chooses its own tile")
+    add("--attention-kv-chunk", type=int, default=4096,
+        help="portable exact-attention KV tile; Triton chooses its own tile")
     add("--steps", type=int, default=1000)
     add("--eval-every", type=int, default=0, help="periodic evaluation interval; 0 disables it")
     add("--stop-exact", type=float, default=None, help="save and stop when periodic exact accuracy reaches threshold")
@@ -78,6 +85,10 @@ def _experiment_options(p, command):
     add("--npairs-density", type=float, default=0., help="MQAR pairs per token, overriding fixed npairs")
     add("--nqueries", type=int, default=4)
     add("--nkeytoks", type=int, choices=[1, 2], default=1)
+    add("--supervision", choices=["task", "all", "tail"], default="task",
+        help="loss/eval positions: task mask, all tokens, or a tail window")
+    add("--tail-tokens", type=int, default=0,
+        help="number of final tokens for --supervision tail")
     add("--eval-batches", type=int, default=1)
     add("--eval-positions", type=int, default=0, help="0=task mask; otherwise uniformly sampled query positions")
     add("--cache", default="auto", choices=["auto", "cuda", "cpu", "disk"])
@@ -86,6 +97,8 @@ def _experiment_options(p, command):
     add("--inference-query-chunk", type=int, default=16)
     add("--workspace-mb", type=int, default=256)
     add("--max-query-states-mb", type=int, default=256)
+    add("--metric-buckets", default="auto",
+        help="absolute position edges such as 0,1024,4096; auto=4 even buckets")
     add("--output", default="", help="eval JSON output, written by rank zero")
 
 
@@ -143,9 +156,14 @@ def parse_args(argv=None):
             p.error(f"{action.dest} must be a boolean")
         if action.choices is not None and value not in action.choices:
             p.error(f"invalid {action.dest}: {value!r}; choose from {action.choices}")
-    positive = ("length", "batch_size", "grad_accum", "encoder_chunk", "query_chunk", "loss_chunk",
+    positive = ("length", "batch_size", "grad_accum", "encoder_chunk", "loss_chunk",
+                "attention_q_chunk", "attention_kv_chunk",
                 "steps", "log_every", "eval_batches", "page_tokens", "inference_query_chunk", "workspace_mb",
                 "max_query_states_mb")
+    if args.query_chunk < 0:
+        p.error("query_chunk must be nonnegative (0=auto)")
+    if args.tail_tokens < 0:
+        p.error("tail_tokens must be nonnegative")
     for name in positive:
         if getattr(args, name) < 1:
             p.error(f"{name} must be positive")

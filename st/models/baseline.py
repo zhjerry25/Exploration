@@ -15,23 +15,27 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .blocks import RotaryEmbedding, FeedForward
+from ..ops.flash import flash_attention
 from ..runtime.parallel import ParallelContext
 
 
 class BaselineBlock(nn.Module):
     """Pre-norm full causal attention + FFN (same shapes as HaloMemoryBlock)."""
 
-    def __init__(self, dim, heads, rope, ffn_ratio):
+    def __init__(self, dim, heads, rope, ffn_ratio, attention_backend="auto"):
         super().__init__()
         self.heads, self.hd = heads, dim // heads
         self.rope = rope
+        if attention_backend not in ("auto", "flash", "math"):
+            raise ValueError("attention_backend must be auto, flash or math")
+        self.attention_backend = attention_backend
         self.attn_norm = nn.LayerNorm(dim)
         self.qkv = nn.Linear(dim, 3 * dim, bias=False)
         self.out = nn.Linear(dim, dim, bias=False)
         self.ffn_norm = nn.LayerNorm(dim)
         self.ffn = FeedForward(dim, ffn_ratio)
 
-    def forward(self, x, positions, parallel=None, checkpoint_chunks=False):
+    def _forward_impl(self, x, positions, parallel):
         parallel = parallel or ParallelContext()
         batch, n, dim = x.shape
         q, k, v = self.qkv(self.attn_norm(x)).reshape(
@@ -39,23 +43,31 @@ class BaselineBlock(nn.Module):
         ).unbind(2)
         q, k = self.rope(q, positions), self.rope(k, positions)
         q, k, v = (parallel.to_heads(t) for t in (q, k, v))
-        ctx = F.scaled_dot_product_attention(
+        # Keeping the call mask-free is required for the native fused causal
+        # kernels. PyTorch chooses FlashAttention or memory-efficient SDPA in
+        # auto mode and falls back to math only where the device requires it.
+        ctx = flash_attention(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-            is_causal=True)
+            is_causal=True, mode=self.attention_backend)
         ctx = parallel.to_sequence(ctx.transpose(1, 2)).reshape(batch, n, dim)
-        def finish(hidden, context):
-            y = hidden + self.out(context)
-            return y + self.ffn(self.ffn_norm(y))
+        y = x + self.out(ctx)
+        return y + self.ffn(self.ffn_norm(y))
+
+    def forward(self, x, positions, parallel=None, checkpoint_chunks=False):
+        parallel = parallel or ParallelContext()
+        # Recompute the whole block so QKV and fused-attention saved tensors
+        # do not accumulate across 65k-token layers.
         if checkpoint_chunks and torch.is_grad_enabled():
-            return checkpoint(finish, x, ctx, use_reentrant=False, preserve_rng_state=False)
-        return finish(x, ctx)
+            return checkpoint(lambda hidden: self._forward_impl(hidden, positions, parallel),
+                              x, use_reentrant=False, preserve_rng_state=False)
+        return self._forward_impl(x, positions, parallel)
 
 
 class BaselineModel(nn.Module):
     """forward([B,N], sup=None) -> [B,N,vocab_size]."""
 
     def __init__(self, vocab_size, dim=256, heads=4, layers=3, ffn_ratio=4,
-                 checkpoint_chunks=False, loss_chunk=128):
+                 checkpoint_chunks=False, loss_chunk=128, backend="auto"):
         super().__init__()
         for name, value in {"vocab_size": vocab_size, "dim": dim,
                             "heads": heads, "layers": layers}.items():
@@ -68,11 +80,14 @@ class BaselineModel(nn.Module):
         self.dim, self.heads, self.hd = dim, heads, dim // heads
         self.block_size = 1  # sequence-shard alignment; no local block semantics
         self.checkpoint_chunks, self.loss_chunk = checkpoint_chunks, loss_chunk
+        if backend not in ("auto", "flash", "math"):
+            raise ValueError("attention backend must be auto, flash or math")
+        self.attention_backend = backend
         self.embedding = nn.Embedding(vocab_size, dim)
         nn.init.normal_(self.embedding.weight, std=0.02)
         self.rope = RotaryEmbedding(self.hd)
         self.blocks = nn.ModuleList(
-            BaselineBlock(dim, heads, self.rope, ffn_ratio)
+            BaselineBlock(dim, heads, self.rope, ffn_ratio, backend)
             for _ in range(layers))
         self.final_norm = nn.LayerNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
@@ -87,9 +102,9 @@ class BaselineModel(nn.Module):
             x = block(x, positions, parallel, self.checkpoint_chunks)
         return x
 
-    def iter_logits(self, input_ids, positions):
+    def iter_logits(self, input_ids, positions, parallel=None, offset=0):
         """Bound the vocabulary projection; the dense baseline encoder stays resident."""
-        x = self.encode(input_ids)
+        x = self.encode(input_ids, parallel=parallel, offset=offset)
         rows = torch.arange(x.shape[0], device=x.device)[:, None]
         for lo in range(0, positions.shape[1], self.loss_chunk):
             sl = slice(lo, min(lo+self.loss_chunk, positions.shape[1]))
@@ -131,7 +146,7 @@ class BaselineModel(nn.Module):
     def forward(self, input_ids, sup=None, *, targets=None, parallel=None, offset=0, compact=False):
         if targets is not None:
             return self.forward_loss(input_ids, targets, sup, parallel, offset)
-        x = self.encode(input_ids)
+        x = self.encode(input_ids, parallel, offset)
         if compact and sup is not None:
             counts = sup.sum(1)
             if int(counts.min()) < 1 or not bool((counts == counts[0]).all()):

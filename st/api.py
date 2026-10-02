@@ -18,10 +18,13 @@ def build_model(config=ModelConfig(), *, execution=ExecutionConfig(), device="cp
             model = StackModel(**options, backend=execution.backend,
                                checkpoint_chunks=execution.checkpoint_chunks,
                                encoder_chunk=execution.encoder_chunk,
-                               pos_chunk=execution.query_chunk, loss_chunk=execution.loss_chunk)
+                               pos_chunk=execution.query_chunk, loss_chunk=execution.loss_chunk,
+                               attention_q_chunk=execution.attention_q_chunk,
+                               attention_kv_chunk=execution.attention_kv_chunk)
         else:
             model = BaselineModel(**options, checkpoint_chunks=execution.checkpoint_chunks,
-                                  loss_chunk=execution.loss_chunk)
+                                  loss_chunk=execution.loss_chunk,
+                                  backend=execution.flash_attention)
     model.model_config = config
     if dtype is not None:
         model.to(dtype=dtype)
